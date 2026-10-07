@@ -16,8 +16,10 @@ import typing
 import pyine.evals.correctness.types as correctness_types
 
 import active_investigator.grading as grading
+import active_investigator.hints as hints
 import active_investigator.questions as questions
 import active_investigator.responder as responder_mod
+import active_investigator.slicing as slicing
 import active_investigator.tracing as tracing
 
 
@@ -76,10 +78,15 @@ class PromptedPicker:
         self,
         picker_llm: responder_mod.Responder,
         max_candidates_shown: int = 40,
+        min_steps: int = 2,
     ) -> None:
-        """Keep the picker model and how many candidates to show it."""
+        """Keep the picker model, how many candidates to show it, and the depth floor.
+
+        ``min_steps`` hides questions answerable by reading a single line; they test nothing.
+        """
         self._llm = picker_llm
         self._max_shown = max_candidates_shown
+        self._min_steps = min_steps
         self._system = responder_mod.load_prompt("pick_system.txt")
         self._user = responder_mod.load_prompt("pick_user.txt")
 
@@ -91,7 +98,8 @@ class PromptedPicker:
         k: int,
     ) -> PickResult:
         """Show numbered candidates (never their answers) and parse the chosen indices."""
-        shown = candidates[: self._max_shown]
+        deep = [q for q in candidates if q.steps_needed >= self._min_steps]
+        shown = (deep or candidates)[: self._max_shown]
         listing = "\n".join(f"{idx + 1}. {q.text}" for idx, q in enumerate(shown))
         reply = self._llm.ask(
             self._system,
@@ -120,10 +128,12 @@ class RankedPicker:
         self,
         responder: responder_mod.Responder,
         max_probe: int = 12,
+        strip: bool = False,
     ) -> None:
-        """Keep the responder to probe with and a cap on how many candidates to probe."""
+        """Keep the responder to probe with, a cap on how many candidates to probe, and the hint setting."""
         self._responder = responder
         self._max_probe = max_probe
+        self._strip = strip
         self._system = responder_mod.load_prompt("followup_system.txt")
         self._user = responder_mod.load_prompt("followup_user.txt")
 
@@ -142,7 +152,7 @@ class RankedPicker:
         right: list[questions.Question] = []
         tokens = 0.0
         for question in probe_set:
-            reply = self._responder.ask(self._system, render_followup(self._user, record, question))
+            reply = self._responder.ask(self._system, render_followup(self._user, record, question, self._strip))
             prefetched[question.key()] = reply
             tokens += reply.completion_tokens
             answer = grading.extract_answer(reply.text)
@@ -158,22 +168,72 @@ class RankedPicker:
         )
 
 
+class OnPathPicker:
+    """Ask about the value that determines the output, then the deepest intermediates feeding it.
+
+    The first question is the last write before the return (so its answer can be compared with
+    the model's own final answer); the rest are ``value_at`` questions lying on that value's
+    backward slice, hardest first, skipping anything answerable from a single line.
+    """
+
+    name = "on_path"
+
+    def __init__(
+        self,
+        min_steps: int = 2,
+    ) -> None:
+        """Keep the depth floor for intermediate questions."""
+        self._min_steps = min_steps
+
+    def pick(
+        self,
+        bundle: tracing.TraceBundle,
+        candidates: list[questions.Question],
+        record: correctness_types.EvalRecord,
+        k: int,
+    ) -> PickResult:
+        """Final-value question first, then on-path intermediates by decreasing dependency depth."""
+        last = bundle.last_write_before_return()
+        if last is None:
+            return FixedLastWritePicker().pick(bundle, candidates, record, k)
+        variable = next(iter(last.writes))
+        final = [q for q in candidates if q.kind == "value_at" and q.step == last.step and q.variable == variable]
+        path = set(slicing.steps_needed(bundle, variable, last.step))
+        on_path = [
+            q
+            for q in candidates
+            if q.kind == "value_at" and q.step in path and q.step != last.step and q.steps_needed >= self._min_steps
+        ]
+        on_path.sort(key=lambda q: (-q.steps_needed, -(q.step or 0)))
+        picked = (final[:1] + on_path)[:k]
+        return PickResult(questions=picked, notes={"on_path_candidates": len(on_path)})
+
+
 def numbered_source(code: str) -> str:
     """Prefix each source line with its 1-based number, since questions refer to lines by number."""
     return "\n".join(f"{idx:4d}| {line}" for idx, line in enumerate(code.splitlines(), start=1))
+
+
+def shown_code(
+    record: correctness_types.EvalRecord,
+    strip: bool,
+) -> str:
+    """The program as the responder sees it: numbered, and with hints removed when asked."""
+    code = record.record.get("code", "")
+    return numbered_source(hints.strip_hints(code) if strip else code)
 
 
 def render_followup(
     template: str,
     record: correctness_types.EvalRecord,
     question: questions.Question,
+    strip: bool = False,
 ) -> str:
-    """Fill the follow-up user prompt for a record and question."""
+    """Fill the follow-up user prompt for a record and question (no prior answer is shown)."""
     return template.format(
-        code=numbered_source(record.record.get("code", "")),
+        code=shown_code(record, strip),
         inputs=record.record.get("inputs", ""),
         entrypoint=tracing.normalize_entrypoint(record.record.get("entrypoint")) or "(script, reads stdin)",
-        original_answer=record.final_answer,
         question=question.text,
     )
 

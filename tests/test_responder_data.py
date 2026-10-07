@@ -97,3 +97,13 @@ class TestProblemSubset:
         kept = data.load_records("x", lmdb_paths=["x"], max_problems=2, seed=0)
         assert len({r.problem_id for r in kept}) == 2
         assert len(kept) == 6  # three samples per problem, none dropped
+
+
+class TestCliDefaults:
+    def test_default_split_is_full_taco_and_problems_has_short_flag(self):
+        import active_investigator.cli as cli
+
+        parser = cli.build_parser()
+        args = parser.parse_args(["run", "--arm", "fixed", "--responder", "vllm:x", "-p", "40"])
+        assert args.split == "TACO"
+        assert args.problems == 40

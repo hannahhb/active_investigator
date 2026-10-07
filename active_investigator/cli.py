@@ -25,7 +25,7 @@ import active_investigator.scorer as scorer_mod
 import active_investigator.tracing as tracing
 
 logger = logging.getLogger("investigator")
-ARMS = ("fixed", "prompted", "ranked")
+ARMS = ("fixed", "on_path", "prompted", "ranked")
 
 
 def build_picker(
@@ -33,16 +33,20 @@ def build_picker(
     responder: responder_mod.Responder,
     picker_llm: responder_mod.Responder | None,
     max_probe: int,
+    min_steps: int = 2,
+    strip: bool = False,
 ) -> pickers.Picker:
     """Map an arm name onto a picker instance."""
     if arm == "fixed":
         return pickers.FixedLastWritePicker()
+    if arm == "on_path":
+        return pickers.OnPathPicker(min_steps=min_steps)
     if arm == "prompted":
         if picker_llm is None:
             raise SystemExit("--picker-llm is required for the prompted arm")
-        return pickers.PromptedPicker(picker_llm)
+        return pickers.PromptedPicker(picker_llm, min_steps=min_steps)
     if arm == "ranked":
-        return pickers.RankedPicker(responder, max_probe=max_probe)
+        return pickers.RankedPicker(responder, max_probe=max_probe, strip=strip)
     raise SystemExit(f"unknown arm {arm!r}; choose from {ARMS}")
 
 
@@ -109,15 +113,21 @@ def cmd_run(args: argparse.Namespace) -> None:
         logger.info("responder accuracy on regenerated predictions: %.3f", sum(r.label for r in records) / len(records))
     scorer = scorer_mod.InvestigatorScorer(
         responder=responder,
-        picker=build_picker(args.arm, responder, picker_llm, args.max_probe),
+        picker=build_picker(args.arm, responder, picker_llm, args.max_probe, args.min_steps, args.strip_hints),
         k=args.k,
         max_workers=args.max_workers,
         question_kinds=tuple(args.kinds.split(",")),
+        strip_hints=args.strip_hints,
+        score_mode=args.score_mode,
+        reconcile=args.reconcile,
     )
     result = scorer.score_records(records)
     out_dir = pathlib.Path(args.out or f"runs/{args.arm}-{datetime.datetime.now():%Y%m%d_%H%M%S}")
     summary = _write_outputs(out_dir, records, result, scorer, args)
     print(metrics.format_summary(summary))
+    if args.reconcile and result.attempt_metadata:
+        print("\nreconcile: what the model did when shown its own values")
+        print(metrics.format_reconcile(metrics.summarize_reconcile(records, result.attempt_metadata)))
     print(f"\nscorer: {json.dumps(scorer.get_metadata())}")
     print(f"outputs: {out_dir}")
 
@@ -163,7 +173,12 @@ def cmd_smoke(args: argparse.Namespace) -> None:
             print("skipping prompted arm (no --picker-llm)")
             continue
         scorer = scorer_mod.InvestigatorScorer(
-            responder, build_picker(arm, responder, picker_llm, args.max_probe), k=args.k
+            responder,
+            build_picker(arm, responder, picker_llm, args.max_probe, args.min_steps, args.strip_hints),
+            k=args.k,
+            strip_hints=args.strip_hints,
+            score_mode=args.score_mode,
+            reconcile=args.reconcile,
         )
         result = scorer.score_records([record])
         payload = next(iter(result.attempt_metadata.values()))
@@ -177,10 +192,8 @@ def cmd_smoke(args: argparse.Namespace) -> None:
             )
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Parse arguments and dispatch."""
-    dotenv.load_dotenv()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+def build_parser() -> argparse.ArgumentParser:
+    """Build the command line parser (kept separate from main so tests can inspect it)."""
     parser = argparse.ArgumentParser(prog="active-investigator")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -192,15 +205,27 @@ def main(argv: list[str] | None = None) -> None:
         p.add_argument("--k", type=int, default=1, help="questions asked per record")
         p.add_argument("--max-probe", type=int, default=12, help="candidates probed per record in the ranked arm")
         p.add_argument("--responder-max-tokens", type=int, default=2048)
+        p.add_argument("--min-steps", type=int, default=2, help="ignore questions answerable from a single line")
+        p.add_argument("--strip-hints", action="store_true", help="hide docstrings and comments from the responder")
+        p.add_argument("--score-mode", choices=("correct", "consistency"), default="correct")
+        p.add_argument("--reconcile", action="store_true", help="confront the model with its own values afterwards")
         p.add_argument("--picker-max-tokens", type=int, default=8192)
 
     run = sub.add_parser("run", help="score PyINE records with one arm")
     add_model_args(run)
     run.add_argument("--arm", choices=ARMS, required=True)
-    run.add_argument("--split", default="TACO-capped", help="split name under splits/, or a path")
+    run.add_argument(
+        "--split", default="TACO", help="split name under splits/ (default: the full TACO split), or a path"
+    )
     run.add_argument("--subset", default="guardrail_test")
     run.add_argument("--lmdb", nargs="*", default=None, help="export LMDB paths; defaults to the organism exports")
-    run.add_argument("--problems", type=int, default=None, help="use only this many problems (all their records)")
+    run.add_argument(
+        "-p",
+        "--problems",
+        type=int,
+        default=None,
+        help="use only this many problems, chosen by --seed (all their records)",
+    )
     run.add_argument("--limit", type=int, default=None, help="cap records; whole samples are kept together")
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--predict", action="store_true", help="regenerate original predictions with the responder")
@@ -215,7 +240,14 @@ def main(argv: list[str] | None = None) -> None:
     smoke.add_argument("--arm", choices=ARMS, default=None, help="one arm; default runs all")
     smoke.set_defaults(func=cmd_smoke)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Parse arguments and dispatch."""
+    dotenv.load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = build_parser().parse_args(argv)
     args.func(args)
 
 

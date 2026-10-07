@@ -1,0 +1,1 @@
+You previously predicted what a Python program produces, and you separately worked out some intermediate values while it runs. Those two things should agree. Decide what the program actually produces and give one answer inside <final></final> tags.\n

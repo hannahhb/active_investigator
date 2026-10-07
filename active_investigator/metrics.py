@@ -73,3 +73,34 @@ def format_summary(summary: dict[str, typing.Any]) -> str:
             f"{fmt(row['mean_score_correct'], 6)} {fmt(row['mean_score_wrong'], 7)} {fmt(row['mean_cost'], 8, 0)}"
         )
     return "\n".join(lines)
+
+
+def summarize_reconcile(
+    records: typing.Sequence[correctness_types.EvalRecord],
+    metadata: typing.Mapping[typing.Any, dict[str, typing.Any]],
+) -> dict[str, dict[str, int]]:
+    """Count what the model did when confronted with its own values, by variant and by evidence.
+
+    Rows are ``<variant>|contradicted`` and ``<variant>|agreed`` depending on whether the elicited
+    values contradicted the model's own final answer; columns are kept / revised_correct /
+    revised_other / no_answer.
+    """
+    table: dict[str, dict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
+    for (_, _, idx), payload in metadata.items():
+        reconcile = payload.get("reconcile")
+        if not reconcile or "outcome" not in reconcile:
+            continue
+        evidence = "contradicted" if payload.get("evidence_contradicts") else "agreed"
+        table[f"{records[idx].code_type}|{evidence}"][reconcile["outcome"]] += 1
+        table[f"overall|{evidence}"][reconcile["outcome"]] += 1
+    return {key: dict(value) for key, value in table.items()}
+
+
+def format_reconcile(table: dict[str, dict[str, int]]) -> str:
+    """Render the reconcile counts as a compact table."""
+    cols = ["kept", "revised_correct", "revised_other", "no_answer", "reconcile_failed"]
+    lines = [f"{'group':24s} " + " ".join(f"{c:>16s}" for c in cols)]
+    for key in sorted(table, key=lambda k: (k.split("|")[0] != "overall", k)):
+        row = table[key]
+        lines.append(f"{key:24s} " + " ".join(f"{row.get(c, 0):16d}" for c in cols))
+    return "\n".join(lines)

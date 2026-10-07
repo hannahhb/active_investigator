@@ -9,9 +9,8 @@ import statistics
 
 import matplotlib
 import matplotlib.pyplot as plt
-import sklearn.metrics
-
 import pyine.evals.persistence as persistence
+import sklearn.metrics
 
 matplotlib.use("Agg")
 
@@ -47,8 +46,8 @@ def ours():
         recs = by[variant]
         labels = [r.label for r in recs]
         scores = [r.score for r in recs]
-        pos = [s for s, l in zip(scores, labels, strict=True) if l]
-        neg = [s for s, l in zip(scores, labels, strict=True) if not l]
+        pos = [score for score, label in zip(scores, labels, strict=True) if label]
+        neg = [score for score, label in zip(scores, labels, strict=True) if not label]
         out[variant] = {
             "auroc": sklearn.metrics.roc_auc_score(labels, scores),
             "tpr05": tpr_at(labels, scores, 0.05),
@@ -125,8 +124,13 @@ def main():
     ax.set_xticklabels(groups_b, color=INK, fontsize=8.5)
     ax.axvspan(len(groups_b) - 1.5, len(groups_b) - 0.5, color="#f0efeb", zorder=0)
     style(ax, "TPR")
-    ax.set_title("B. TPR at fixed FPR  (solid: FPR ≤ 0.05, faint: FPR ≤ 0.20)", loc="left", color=INK, fontsize=10.5,
-                 fontweight="bold")
+    ax.set_title(
+        "B. TPR at fixed FPR  (solid: FPR ≤ 0.05, faint: FPR ≤ 0.20)",
+        loc="left",
+        color=INK,
+        fontsize=10.5,
+        fontweight="bold",
+    )
 
     # C - our score when the organism was right vs wrong
     ax = axes[1, 0]
@@ -134,15 +138,27 @@ def main():
     for v_idx, variant in enumerate(VARIANTS):
         ok, bad = data[variant]["score_ok"], data[variant]["score_bad"]
         ax.bar(v_idx - width / 2 - 0.02, ok, width=width, color=COLORS[variant], linewidth=0)
-        ax.bar(v_idx + width / 2 + 0.02, bad, width=width, color=COLORS[variant], linewidth=0, hatch="////",
-               edgecolor="#fcfcfb")
+        ax.bar(
+            v_idx + width / 2 + 0.02,
+            bad,
+            width=width,
+            color=COLORS[variant],
+            linewidth=0,
+            hatch="////",
+            edgecolor="#fcfcfb",
+        )
         ax.text(v_idx - width / 2 - 0.02, ok + 0.015, f"{ok:.2f}", ha="center", fontsize=8, color=INK)
         ax.text(v_idx + width / 2 + 0.02, bad + 0.015, f"{bad:.2f}", ha="center", fontsize=8, color=INK)
     ax.set_xticks(range(3))
     ax.set_xticklabels(VARIANTS, color=INK, fontsize=8.5)
     style(ax, "mean trust score")
-    ax.set_title("C. Ours: trust score when organism was right (solid) vs wrong (hatched)", loc="left", color=INK,
-                 fontsize=10.5, fontweight="bold")
+    ax.set_title(
+        "C. Ours: trust score when organism was right (solid) vs wrong (hatched)",
+        loc="left",
+        color=INK,
+        fontsize=10.5,
+        fontweight="bold",
+    )
 
     # D - cost per record
     ax = axes[1, 1]
@@ -157,20 +173,34 @@ def main():
 
     handles = [matplotlib.patches.Patch(color=COLORS[v], label=v) for v in VARIANTS]
     fig.legend(handles=handles, loc="upper center", ncol=3, frameon=False, fontsize=9.5, bbox_to_anchor=(0.5, 0.965))
-    fig.suptitle("Overseer performance by task variant — PyINE paper reference overseers vs. the reconsider baseline",
-                 color=INK, fontsize=12, y=0.995)
+    fig.suptitle(
+        "Overseer performance by task variant — PyINE paper reference overseers vs. the reconsider baseline",
+        color=INK,
+        fontsize=12,
+        y=0.995,
+    )
     n = sum(data[v]["n"] for v in VARIANTS)
-    fig.text(0.06, 0.03,
-             "Reference bars: PyINE paper Tables 5, 7, 8 — full held-out test set (44,820 records); LLM overseers evaluated once.\n"
-             f"Reconsider (shaded): this project — TACO40 subset (40 problems, {n:,} records), organism as responder, "
-             "fixed “re-derive your answer” question, gpt-5-mini verdict. Sample sizes differ; compare shapes, not decimals.",
-             color=INK2, fontsize=7.8, va="bottom")
+    fig.text(
+        0.06,
+        0.03,
+        "Reference bars: PyINE paper Tables 5, 7, 8 — full held-out test set (44,820 records); "
+        "LLM overseers evaluated once.\n"
+        f"Reconsider (shaded): this project — TACO40 subset (40 problems, {n:,} records), organism as responder, "
+        "fixed “re-derive your answer” question, gpt-5-mini verdict. "
+        "Sample sizes differ; compare shapes, not decimals.",
+        color=INK2,
+        fontsize=7.8,
+        va="bottom",
+    )
     out = "figures/reconsider_vs_paper.png"
     fig.savefig(out, dpi=170)
     print("saved", out)
     for v in VARIANTS:
         d = data[v]
-        print(f"{v:11s} auroc {d['auroc']:.3f} tpr05 {d['tpr05']:.3f} tpr20 {d['tpr20']:.3f} ok {d['score_ok']:.3f} bad {d['score_bad']:.3f} cost {d['cost']:.0f}")
+        print(
+            f"{v:11s} auroc {d['auroc']:.3f} tpr05 {d['tpr05']:.3f} tpr20 {d['tpr20']:.3f} "
+            f"ok {d['score_ok']:.3f} bad {d['score_bad']:.3f} cost {d['cost']:.0f}"
+        )
 
 
 if __name__ == "__main__":

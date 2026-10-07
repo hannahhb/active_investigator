@@ -25,17 +25,27 @@ class TestPromptedPicker:
                 return pickers.responder_mod.Reply(text="[2, 1]", completion_tokens=3.0)
 
         cands = questions.generate_candidates(bundle)
-        result = pickers.PromptedPicker(Chooser()).pick(bundle, cands, record, k=2)
+        result = pickers.PromptedPicker(Chooser(), min_steps=1).pick(bundle, cands, record, k=2)
         assert [q.text for q in result.questions] == [cands[1].text, cands[0].text]
         assert result.probe_tokens == 3.0
 
     def test_listing_is_question_text_only(self, bundle, record, fake_responder_factory):
         chooser = fake_responder_factory()
         cands = questions.generate_candidates(bundle)
-        pickers.PromptedPicker(chooser, max_candidates_shown=10).pick(bundle, cands, record, k=1)
+        pickers.PromptedPicker(chooser, max_candidates_shown=10, min_steps=1).pick(bundle, cands, record, k=1)
         listing = chooser.calls[0].split("CANDIDATE QUESTIONS:\n")[1].split("\n\nChoose")[0]
         expected = "\n".join(f"{idx + 1}. {q.text}" for idx, q in enumerate(cands[:10]))
         assert listing == expected  # numbered question texts and nothing else: no truths leak
+
+
+class TestPromptedDepthFloor:
+    def test_single_line_questions_hidden_by_default(self, bundle, record, fake_responder_factory):
+        chooser = fake_responder_factory()
+        cands = questions.generate_candidates(bundle)
+        pickers.PromptedPicker(chooser).pick(bundle, cands, record, k=1)
+        listing = chooser.calls[0].split("CANDIDATE QUESTIONS:\n")[1].split("\n\nChoose")[0]
+        trivial = [q.text for q in cands if q.steps_needed == 1]
+        assert trivial and not any(text in listing for text in trivial)
 
 
 class TestRankedPicker:
@@ -92,3 +102,34 @@ class TestPromptRendering:
         prompt = pickers.render_followup(pickers.responder_mod.load_prompt("followup_user.txt"), record, cands[0])
         assert "   1| def process(nums):" in prompt
         assert "   2|     total = 0" in prompt
+
+
+class TestTracingHappensBeforeThePool:
+    def test_all_tracing_on_main_thread_before_any_model_call(self, record, fake_responder_factory, monkeypatch):
+        import threading
+
+        import active_investigator.tracing as tracing
+
+        events: list[str] = []
+        real = tracing.trace_record
+
+        def traced(payload, timeout_seconds=30):
+            events.append("trace:" + threading.current_thread().name)
+            return real(payload, timeout_seconds=timeout_seconds)
+
+        responder = fake_responder_factory(answers={"value of `total`": "10"})
+        original_ask = responder.ask
+
+        def ask(system, user):
+            events.append("ask")
+            return original_ask(system, user)
+
+        responder.ask = ask
+        monkeypatch.setattr(scorer_mod.tracing, "trace_record", traced)
+        scorer = scorer_mod.InvestigatorScorer(responder, pickers.FixedLastWritePicker(), k=1, max_workers=4)
+        result = scorer.score_records([record, record, record])
+        assert result.scores == [1.0, 1.0, 1.0]
+        traces = [e for e in events if e.startswith("trace:")]
+        assert len(traces) == 3
+        assert all(e == "trace:MainThread" for e in traces), traces
+        assert events.index("ask") > max(i for i, e in enumerate(events) if e.startswith("trace:"))

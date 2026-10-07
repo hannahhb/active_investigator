@@ -5,9 +5,7 @@ PROGRAM (line numbers on the left are for reference only):
 INPUT: {inputs}
 ENTRYPOINT: {entrypoint}
 
-YOUR EARLIER ANSWER: {original_answer}
-
-FOLLOW-UP QUESTION:
+QUESTION:
 {question}
 
 Reply with the value inside <final></final> tags.

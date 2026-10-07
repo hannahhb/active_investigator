@@ -130,7 +130,9 @@ def _is_data_write(
     value: str,
 ) -> bool:
     """Keep assignments of data; drop dunder bookkeeping and imported modules, functions and classes."""
-    return not name.startswith("__") and not value.startswith(_NON_DATA_PREFIXES)
+    if name.startswith("__") or value.startswith(_NON_DATA_PREFIXES):
+        return False
+    return not (value.startswith("<") and value.endswith(">"))  # object reprs such as mocks, callables, handles
 
 
 def normalize_entrypoint(value: typing.Any) -> str | None:

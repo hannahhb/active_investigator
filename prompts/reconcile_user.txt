@@ -1,0 +1,13 @@
+PROGRAM (line numbers on the left are for reference only):
+```
+{code}
+```
+INPUT: {inputs}
+ENTRYPOINT: {entrypoint}
+
+YOUR EARLIER ANSWER FOR WHAT THE PROGRAM PRODUCES: {original_answer}
+
+VALUES YOU WORKED OUT JUST NOW:
+{evidence}
+
+Give one final answer for what the program produces, inside <final></final> tags.

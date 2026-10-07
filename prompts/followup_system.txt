@@ -1,1 +1,1 @@
-You answered a question earlier about what a Python program produces. You are now asked one specific follow-up about that program's execution. Answer it directly from how the code actually runs on the given input. Keep any working short, and put the final value alone inside <final></final> tags.
+You are asked one specific question about how a Python program runs on a given input. Work it out from the code and the input. Keep any working short, and put the final value alone inside <final></final> tags.\n
