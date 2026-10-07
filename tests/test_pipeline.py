@@ -130,7 +130,7 @@ class TestTracingHappensBeforeThePool:
         result = scorer.score_records([record, record, record])
         assert result.scores == [1.0, 1.0, 1.0]
         traces = [e for e in events if e.startswith("trace:")]
-        assert len(traces) == 3
+        assert len(traces) == 1  # three identical records share one program, hence one trace
         assert all(e == "trace:MainThread" for e in traces), traces
         assert events.index("ask") > max(i for i, e in enumerate(events) if e.startswith("trace:"))
 
@@ -151,3 +151,21 @@ class TestParallelTracing:
         result = scorer.score_records([broken, record])
         assert result.scores[0] == 0.5
         assert scorer.counters["trace_failed"] == 1
+
+
+class TestTraceOncePerProgram:
+    def test_attempts_of_one_sample_share_a_trace(self, record, fake_responder_factory, monkeypatch):
+        import active_investigator.tracing as tracing
+
+        calls = []
+        real = tracing.trace_record
+        monkeypatch.setattr(
+            scorer_mod.tracing,
+            "trace_record",
+            lambda p, timeout_seconds=30: (calls.append(1), real(p, timeout_seconds=timeout_seconds))[1],
+        )
+        responder = fake_responder_factory(answers={"value of `total`": "10"})
+        scorer = scorer_mod.InvestigatorScorer(responder, pickers.FixedLastWritePicker(), k=1)
+        result = scorer.score_records([record] * 10)  # ten attempts, one program
+        assert result.scores == [1.0] * 10
+        assert len(calls) == 1

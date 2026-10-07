@@ -72,17 +72,25 @@ class Prepared:
     """Set when the record cannot be investigated at all; the pool returns it untouched."""
 
 
-def prepare_record(
-    record: correctness_types.EvalRecord,
+ProgramKey = tuple[str, str, str]
+"""(code, inputs, entrypoint): everything the trace depends on. Attempts of one sample share it."""
+
+
+def program_key(record: correctness_types.EvalRecord) -> ProgramKey:
+    """Identity of the program a record was answered about."""
+    payload = record.record
+    return (str(payload.get("code", "")), str(payload.get("inputs", "")), str(payload.get("entrypoint", "")))
+
+
+def trace_program(
+    payload: dict[str, typing.Any],
     kinds: tuple[questions.QuestionKind, ...],
     timeout_seconds: float,
     default_score: float,
 ) -> Prepared:
-    """Trace one record and enumerate its questions. Module-level so it can run in a worker process."""
-    if record.final_answer is None:
-        return Prepared(None, [], Outcome(0.0, 0.0, {"outcome": "missing_original_answer"}))
+    """Trace one program and enumerate its questions. Module-level so it can run in a worker process."""
     try:
-        bundle = tracing.trace_record(record.record, timeout_seconds=timeout_seconds)
+        bundle = tracing.trace_record(payload, timeout_seconds=timeout_seconds)
     except Exception as exc:  # tracing arbitrary programs can fail; record why rather than crash the run
         return Prepared(None, [], Outcome(default_score, 0.0, {"outcome": "trace_failed", "error": repr(exc)[:300]}))
     candidates = questions.generate_candidates(bundle, kinds=kinds)
@@ -175,29 +183,40 @@ class InvestigatorScorer:
         self,
         records: list[correctness_types.EvalRecord],
     ) -> list[Prepared]:
-        """Trace every record before any worker thread exists, in parallel processes when asked.
+        """Trace each distinct program once, before any worker thread exists, then map records onto it.
 
-        Forking worker processes here is safe because no threads are running yet; each worker
-        then runs the tracer, which forks its own sandboxed child. Counters are tallied in the
-        parent from the returned outcomes so nothing is shared across processes.
+        The ten attempts of a sample share one program and input, so they share one trace. Forking
+        worker processes here is safe because no threads are running yet.
         """
+        unique: dict[ProgramKey, dict[str, typing.Any]] = {}
+        for record in records:
+            if record.final_answer is not None:
+                unique.setdefault(program_key(record), record.record)
+        keys = list(unique)
+        logger.info("tracing %d distinct programs for %d records", len(keys), len(records))
         job = functools.partial(
-            prepare_record, kinds=self._kinds, timeout_seconds=self._trace_timeout, default_score=self._default
+            trace_program, kinds=self._kinds, timeout_seconds=self._trace_timeout, default_score=self._default
         )
-        prepared: list[Prepared] = []
-        if self._trace_workers > 1:
+        traced: dict[ProgramKey, Prepared] = {}
+        if self._trace_workers > 1 and len(keys) > 1:
             with concurrent.futures.ProcessPoolExecutor(max_workers=self._trace_workers) as pool:
-                iterator = pool.map(job, records, chunksize=4)
-                for idx, item in enumerate(iterator, start=1):
-                    prepared.append(item)
-                    if idx % 50 == 0 or idx == len(records):
-                        logger.info("traced %d/%d records", idx, len(records))
+                results = pool.map(job, [unique[key] for key in keys], chunksize=2)
+                for idx, (key, item) in enumerate(zip(keys, results, strict=True), start=1):
+                    traced[key] = item
+                    if idx % 25 == 0 or idx == len(keys):
+                        logger.info("traced %d/%d programs", idx, len(keys))
         else:
-            for idx, record in enumerate(records, start=1):
-                prepared.append(job(record))
-                if idx % 50 == 0 or idx == len(records):
-                    logger.info("traced %d/%d records", idx, len(records))
-        for item in prepared:
+            for idx, key in enumerate(keys, start=1):
+                traced[key] = job(unique[key])
+                if idx % 25 == 0 or idx == len(keys):
+                    logger.info("traced %d/%d programs", idx, len(keys))
+        prepared: list[Prepared] = []
+        for record in records:
+            if record.final_answer is None:
+                prepared.append(Prepared(None, [], Outcome(0.0, 0.0, {"outcome": "missing_original_answer"})))
+                continue
+            item = traced[program_key(record)]
+            prepared.append(item)
             if item.failure is not None and item.failure.metadata.get("outcome") in self.counters:
                 self._bump(item.failure.metadata["outcome"])
         return prepared
