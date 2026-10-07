@@ -169,3 +169,66 @@ class TestTraceOncePerProgram:
         result = scorer.score_records([record] * 10)  # ten attempts, one program
         assert result.scores == [1.0] * 10
         assert len(calls) == 1
+
+
+class TestTraceCache:
+    def _counting_tracer(self, monkeypatch):
+        calls = []
+        real = scorer_mod.tracing.trace_record
+        monkeypatch.setattr(
+            scorer_mod.tracing,
+            "trace_record",
+            lambda p, timeout_seconds=30: (calls.append(1), real(p, timeout_seconds=timeout_seconds))[1],
+        )
+        return calls
+
+    def test_second_run_reads_the_trace_from_disk(self, record, fake_responder_factory, monkeypatch, tmp_path):
+        calls = self._counting_tracer(monkeypatch)
+        responder = fake_responder_factory(answers={"value of `total`": "10"})
+        first = scorer_mod.InvestigatorScorer(responder, pickers.FixedLastWritePicker(), k=1, trace_cache=tmp_path)
+        assert first.score_records([record] * 3).scores == [1.0] * 3
+        assert len(calls) == 1
+        assert len(list(tmp_path.glob("*.pkl"))) == 1
+        second = scorer_mod.InvestigatorScorer(responder, pickers.FixedLastWritePicker(), k=1, trace_cache=tmp_path)
+        assert second.score_records([record] * 3).scores == [1.0] * 3
+        assert len(calls) == 1  # no new trace
+        assert second.counters["trace_cache_hits"] == 1
+        assert second.get_metadata()["trace_cache"] == str(tmp_path)
+
+    def test_cache_is_keyed_by_question_kinds(self, record, fake_responder_factory, monkeypatch, tmp_path):
+        calls = self._counting_tracer(monkeypatch)
+        responder = fake_responder_factory(answers={"value of `total`": "10"})
+        scorer_mod.InvestigatorScorer(responder, pickers.FixedLastWritePicker(), trace_cache=tmp_path).score_records(
+            [record]
+        )
+        scorer_mod.InvestigatorScorer(
+            responder, pickers.FixedLastWritePicker(), trace_cache=tmp_path, question_kinds=("value_at",)
+        ).score_records([record])
+        assert len(calls) == 2  # different candidate set, so a separate entry
+
+    def test_failed_traces_are_cached_separately_and_retried_once_deleted(
+        self, record, fake_responder_factory, monkeypatch, tmp_path
+    ):
+        calls = []
+        monkeypatch.setattr(
+            scorer_mod.tracing, "trace_record", lambda p, timeout_seconds=30: (calls.append(1), 1 / 0)[1]
+        )
+        make = lambda: scorer_mod.InvestigatorScorer(  # noqa: E731
+            fake_responder_factory(), pickers.FixedLastWritePicker(), trace_cache=tmp_path
+        )
+        scorer = make()
+        scorer.score_records([record])
+        assert scorer.counters["trace_failed"] == 1
+        assert [p.name.endswith(".failed.pkl") for p in tmp_path.glob("*.pkl")] == [True]
+        make().score_records([record])
+        assert len(calls) == 1  # failure served from cache, not retried
+        for path in tmp_path.glob("*.failed.pkl"):
+            path.unlink()
+        make().score_records([record])
+        assert len(calls) == 2  # deleting the marker forces a retry
+
+    def test_prepare_programs_works_without_a_responder(self, record, tmp_path):
+        traced = scorer_mod.prepare_programs([record], kinds=("value_at",), cache_dir=tmp_path)
+        assert len(traced) == 1
+        assert next(iter(traced.values())).failure is None
+        assert len(list(tmp_path.glob("*.pkl"))) == 1

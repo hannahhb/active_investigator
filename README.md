@@ -51,6 +51,15 @@ The follow-up is phrased so the responder has nothing to defend:
 - **Tracing happens once per distinct program**, before any model call. The ten attempts of a sample
   share one program and input, so 2,700 records need ~270 traces. `--trace-workers N` runs them in `N`
   parallel processes (about 1 s per trace single-threaded; set it to your CPU count on a cluster node).
+  `--trace-cache DIR` keeps traced programs on disk, so a rerun or a different arm over the same
+  problems skips tracing entirely. Failed traces (mostly 30 s timeouts) are cached as `*.failed.pkl`;
+  delete those files to retry them.
+  Tracing needs no GPU, so fill the cache on a laptop and copy the directory next to the GPU run:
+
+      uv run active-investigator run --trace-only --trace-cache traces -p 40 --trace-workers 8
+- **Servers are checked before anything else.** The run lists the responder's (and picker's) models
+  with one request and stops with a clear message if a server is down or serves a different model
+  name, instead of tracing for minutes and then failing every record.
 - **`--reconcile`** adds one call per record that shows the model its final answer next to the values
   it just gave and asks for one answer. The outcome — `kept`, `revised_correct`, `revised_other` — is
   reported by variant and by whether its own evidence contradicted it. This is the direct measure of

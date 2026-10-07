@@ -10,7 +10,11 @@ from __future__ import annotations
 import concurrent.futures
 import dataclasses
 import functools
+import hashlib
+import json
 import logging
+import pathlib
+import pickle
 import statistics
 import threading
 import typing
@@ -82,6 +86,47 @@ def program_key(record: correctness_types.EvalRecord) -> ProgramKey:
     return (str(payload.get("code", "")), str(payload.get("inputs", "")), str(payload.get("entrypoint", "")))
 
 
+CACHE_FORMAT = 1
+"""Bump when ``Prepared``, ``TraceBundle`` or ``Question`` change shape, so stale cache files are ignored."""
+
+
+def cache_path(
+    cache_dir: pathlib.Path,
+    key: ProgramKey,
+    kinds: tuple[questions.QuestionKind, ...],
+) -> pathlib.Path:
+    """Where a program's prepared trace lives on disk; depends on the program and the question kinds."""
+    digest = hashlib.sha256(json.dumps([CACHE_FORMAT, list(key), list(kinds)]).encode()).hexdigest()
+    return cache_dir / f"{digest}.pkl"
+
+
+def failed_path(path: pathlib.Path) -> pathlib.Path:
+    """Sibling name for a program whose trace failed, so ``rm traces/*.failed.pkl`` forces a retry."""
+    return path.with_suffix(".failed.pkl")
+
+
+def load_cached(path: pathlib.Path) -> Prepared | None:
+    """Read a cached trace (good or failed); a missing or unreadable file is a miss, never an error."""
+    for candidate in (path, failed_path(path)):
+        try:
+            with candidate.open("rb") as handle:
+                item = pickle.load(handle)
+        except (OSError, pickle.UnpicklingError, EOFError, AttributeError):
+            continue
+        if isinstance(item, Prepared):
+            return item
+    return None
+
+
+def save_cached(path: pathlib.Path, item: Prepared) -> None:
+    """Write a trace atomically so a concurrent reader never sees a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{threading.get_ident()}.tmp")
+    with tmp.open("wb") as handle:
+        pickle.dump(item, handle)
+    tmp.replace(path)
+
+
 def trace_program(
     payload: dict[str, typing.Any],
     kinds: tuple[questions.QuestionKind, ...],
@@ -97,6 +142,61 @@ def trace_program(
     if not candidates:
         return Prepared(bundle, [], Outcome(default_score, 0.0, {"outcome": "no_candidates"}))
     return Prepared(bundle, candidates, None)
+
+
+def prepare_programs(
+    records: list[correctness_types.EvalRecord],
+    kinds: tuple[questions.QuestionKind, ...],
+    timeout_seconds: float = 30,
+    default_score: float = 0.5,
+    workers: int = 1,
+    cache_dir: pathlib.Path | None = None,
+    counters: dict[str, int] | None = None,
+) -> dict[ProgramKey, Prepared]:
+    """Trace each distinct program behind ``records`` once, reading and filling ``cache_dir`` when given.
+
+    The ten attempts of a sample share one program and input, so they share one trace. Forking
+    worker processes here is safe only while no threads are running, which is why this runs
+    before the scorer's thread pool. A failed trace (usually a 30 s timeout) is cached under a
+    ``.failed.pkl`` name so reruns stay fast; delete those files to retry them.
+    """
+    unique: dict[ProgramKey, dict[str, typing.Any]] = {}
+    for record in records:
+        if record.final_answer is not None:
+            unique.setdefault(program_key(record), record.record)
+    traced: dict[ProgramKey, Prepared] = {}
+    if cache_dir is not None:
+        for key in unique:
+            item = load_cached(cache_path(cache_dir, key, kinds))
+            if item is not None:
+                traced[key] = item
+        if counters is not None:
+            counters["trace_cache_hits"] += len(traced)
+    keys = [key for key in unique if key not in traced]
+    logger.info("tracing %d distinct programs for %d records (%d from cache)", len(keys), len(records), len(traced))
+    job = functools.partial(trace_program, kinds=kinds, timeout_seconds=timeout_seconds, default_score=default_score)
+
+    def store(key: ProgramKey, item: Prepared) -> None:
+        traced[key] = item
+        if cache_dir is None:
+            return
+        path = cache_path(cache_dir, key, kinds)
+        failed = item.failure is not None and item.failure.metadata.get("outcome") == "trace_failed"
+        save_cached(failed_path(path) if failed else path, item)
+
+    if workers > 1 and len(keys) > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            results = pool.map(job, [unique[key] for key in keys], chunksize=2)
+            for idx, (key, item) in enumerate(zip(keys, results, strict=True), start=1):
+                store(key, item)
+                if idx % 25 == 0 or idx == len(keys):
+                    logger.info("traced %d/%d programs", idx, len(keys))
+    else:
+        for idx, key in enumerate(keys, start=1):
+            store(key, job(unique[key]))
+            if idx % 25 == 0 or idx == len(keys):
+                logger.info("traced %d/%d programs", idx, len(keys))
+    return traced
 
 
 class InvestigatorScorer:
@@ -115,6 +215,7 @@ class InvestigatorScorer:
         score_mode: ScoreMode = "correct",
         reconcile: bool = False,
         trace_workers: int = 1,
+        trace_cache: pathlib.Path | str | None = None,
     ) -> None:
         """Wire a responder and a picker together under a fixed per-record question budget.
 
@@ -125,6 +226,8 @@ class InvestigatorScorer:
                 own final answer (a shortcut caught in its own words).
             reconcile: After eliciting, confront the model with its own values and record whether it
                 keeps, corrects, or changes its final answer. One extra call per record.
+            trace_cache: Directory where traced programs are kept between runs. Any run (any arm)
+                over the same programs then skips straight to the asking phase.
         """
         self._responder = responder
         self._picker = picker
@@ -139,6 +242,7 @@ class InvestigatorScorer:
         self._default = default_score_on_error
         self._trace_timeout = trace_timeout_seconds
         self._trace_workers = trace_workers
+        self._trace_cache = pathlib.Path(trace_cache) if trace_cache else None
         self._system = responder_mod.load_prompt("followup_system.txt")
         self._user = responder_mod.load_prompt("followup_user.txt")
         self._lock = threading.Lock()
@@ -148,6 +252,7 @@ class InvestigatorScorer:
             "no_candidates": 0,
             "picker_empty": 0,
             "ask_failed": 0,
+            "trace_cache_hits": 0,
         }
 
     def score_records(
@@ -183,33 +288,16 @@ class InvestigatorScorer:
         self,
         records: list[correctness_types.EvalRecord],
     ) -> list[Prepared]:
-        """Trace each distinct program once, before any worker thread exists, then map records onto it.
-
-        The ten attempts of a sample share one program and input, so they share one trace. Forking
-        worker processes here is safe because no threads are running yet.
-        """
-        unique: dict[ProgramKey, dict[str, typing.Any]] = {}
-        for record in records:
-            if record.final_answer is not None:
-                unique.setdefault(program_key(record), record.record)
-        keys = list(unique)
-        logger.info("tracing %d distinct programs for %d records", len(keys), len(records))
-        job = functools.partial(
-            trace_program, kinds=self._kinds, timeout_seconds=self._trace_timeout, default_score=self._default
+        """Trace each distinct program once, before any worker thread exists, then map records onto it."""
+        traced = prepare_programs(
+            records,
+            kinds=self._kinds,
+            timeout_seconds=self._trace_timeout,
+            default_score=self._default,
+            workers=self._trace_workers,
+            cache_dir=self._trace_cache,
+            counters=self.counters,
         )
-        traced: dict[ProgramKey, Prepared] = {}
-        if self._trace_workers > 1 and len(keys) > 1:
-            with concurrent.futures.ProcessPoolExecutor(max_workers=self._trace_workers) as pool:
-                results = pool.map(job, [unique[key] for key in keys], chunksize=2)
-                for idx, (key, item) in enumerate(zip(keys, results, strict=True), start=1):
-                    traced[key] = item
-                    if idx % 25 == 0 or idx == len(keys):
-                        logger.info("traced %d/%d programs", idx, len(keys))
-        else:
-            for idx, key in enumerate(keys, start=1):
-                traced[key] = job(unique[key])
-                if idx % 25 == 0 or idx == len(keys):
-                    logger.info("traced %d/%d programs", idx, len(keys))
         prepared: list[Prepared] = []
         for record in records:
             if record.final_answer is None:
@@ -349,6 +437,7 @@ class InvestigatorScorer:
             "score_mode": self._score_mode,
             "reconcile": self._reconcile,
             "responder": self._responder.spec.describe(),
+            "trace_cache": str(self._trace_cache) if self._trace_cache else None,
             **self.counters,
         }
 

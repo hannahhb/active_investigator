@@ -86,8 +86,52 @@ def _write_outputs(
     return summary
 
 
+def _check_reachable(*responders: responder_mod.Responder | None) -> None:
+    """Fail fast, before loading or tracing anything, if a model server is down."""
+    for item in responders:
+        if item is None:
+            continue
+        try:
+            item.check_reachable()
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        logger.info("%s is reachable", item.spec.describe())
+
+
+def _trace_only(args: argparse.Namespace) -> None:
+    """Fill the trace cache for the selected problems without any model server; CPU only."""
+    if not args.trace_cache:
+        raise SystemExit("--trace-only needs --trace-cache DIR to write into")
+    records = data.load_records(
+        args.split,
+        lmdb_paths=args.lmdb or None,
+        subset=args.subset,
+        limit=args.limit,
+        seed=args.seed,
+        max_problems=args.problems,
+    )
+    counters = {"trace_cache_hits": 0}
+    traced = scorer_mod.prepare_programs(
+        records,
+        kinds=tuple(args.kinds.split(",")),
+        workers=args.trace_workers,
+        cache_dir=pathlib.Path(args.trace_cache),
+        counters=counters,
+    )
+    failed = sum(1 for item in traced.values() if item.failure is not None)
+    print(
+        f"traced {len(traced)} distinct programs for {len(records)} records "
+        f"({counters['trace_cache_hits']} already cached, {failed} with no usable trace) -> {args.trace_cache}"
+    )
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """Score records from the PyINE exports with the chosen arm."""
+    if args.trace_only:
+        _trace_only(args)
+        return
+    if not args.responder or not args.arm:
+        raise SystemExit("--responder and --arm are required (unless --trace-only)")
     responder = responder_mod.Responder(
         args.responder,
         max_tokens=args.responder_max_tokens,
@@ -98,6 +142,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         picker_llm = responder_mod.Responder(
             args.picker_llm, max_tokens=args.picker_max_tokens, requests_per_second=args.rps
         )
+    _check_reachable(responder, picker_llm)
     records = data.load_records(
         args.split,
         lmdb_paths=args.lmdb or None,
@@ -121,6 +166,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         score_mode=args.score_mode,
         reconcile=args.reconcile,
         trace_workers=args.trace_workers,
+        trace_cache=args.trace_cache,
     )
     result = scorer.score_records(records)
     out_dir = pathlib.Path(args.out or f"runs/{args.arm}-{datetime.datetime.now():%Y%m%d_%H%M%S}")
@@ -144,10 +190,13 @@ SMOKE_SRC = """def rotate_right(xs):
 
 def cmd_smoke(args: argparse.Namespace) -> None:
     """Run every arm once on a tiny program whose docstring lies about what it does."""
+    if not args.responder:
+        raise SystemExit("--responder is required")
     responder = responder_mod.Responder(args.responder, max_tokens=args.responder_max_tokens)
     picker_llm = (
         responder_mod.Responder(args.picker_llm, max_tokens=args.picker_max_tokens) if args.picker_llm else None
     )
+    _check_reachable(responder, picker_llm)
     bundle = tracing.trace_code(SMOKE_SRC, '{"xs": [1, 2, 3, 4]}', "rotate_right")
     print(f"traced: return={bundle.return_value} steps={len(bundle.steps)} (docstring claims [4, 1, 2, 3])")
     record = correctness_types.EvalRecord(
@@ -200,7 +249,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_model_args(p: argparse.ArgumentParser) -> None:
         p.add_argument(
-            "--responder", required=True, help="vllm:<name>@<url> | openrouter:<vendor/model> | openai:<model>"
+            "--responder",
+            default=None,
+            help="vllm:<name>@<url> | openrouter:<vendor/model> | openai:<model> (not needed with --trace-only)",
         )
         p.add_argument("--picker-llm", default=None, help="model that chooses questions in the prompted arm")
         p.add_argument("--k", type=int, default=1, help="questions asked per record")
@@ -214,7 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="score PyINE records with one arm")
     add_model_args(run)
-    run.add_argument("--arm", choices=ARMS, required=True)
+    run.add_argument("--arm", choices=ARMS, default=None, help="required unless --trace-only")
     run.add_argument(
         "--split", default="TACO", help="split name under splits/ (default: the full TACO split), or a path"
     )
@@ -233,6 +284,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--kinds", default="value_at,branch_at,execution_count")
     run.add_argument("--max-workers", type=int, default=8, help="concurrent model calls")
     run.add_argument("--trace-workers", type=int, default=1, help="processes for the tracing pass (try your CPU count)")
+    run.add_argument(
+        "--trace-cache",
+        default=None,
+        help="directory to keep traced programs between runs; later runs over the same programs skip tracing",
+    )
+    run.add_argument(
+        "--trace-only",
+        action="store_true",
+        help="only fill --trace-cache for the selected problems; needs no model server, so it can run on a laptop",
+    )
     run.add_argument("--rps", type=float, default=None, help="rate limit per model, requests per second")
     run.add_argument("--out", default=None)
     run.set_defaults(func=cmd_run)

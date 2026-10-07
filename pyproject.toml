@@ -5,6 +5,7 @@ description = "Active investigator: follow-up questions grounded in execution tr
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "pyine",
+    "httpx>=0.27",
     "scikit-learn>=1.5",
     "python-dotenv>=1.0",
 ]

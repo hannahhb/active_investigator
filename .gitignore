@@ -5,3 +5,6 @@ __pycache__/
 runs/
 .pytest_cache/
 .ruff_cache/
+traces/
+*.log
+*.tgz

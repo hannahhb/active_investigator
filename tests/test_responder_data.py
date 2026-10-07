@@ -1,3 +1,4 @@
+import httpx
 import pytest
 
 import active_investigator.data as data
@@ -107,3 +108,47 @@ class TestCliDefaults:
         args = parser.parse_args(["run", "--arm", "fixed", "--responder", "vllm:x", "-p", "40"])
         assert args.split == "TACO"
         assert args.problems == 40
+
+
+class TestReachability:
+    """The check is one GET to /models; a fake transport stands in for the server."""
+
+    @staticmethod
+    def _transport(handler):
+        return httpx.MockTransport(handler)
+
+    def test_vllm_server_serving_the_model_passes(self):
+        def handler(request):
+            assert request.url.path.endswith("/v1/models")
+            assert request.headers["authorization"] == "Bearer EMPTY"
+            return httpx.Response(200, json={"data": [{"id": "pyine-organism"}]})
+
+        responder = responder_mod.Responder("vllm:pyine-organism@http://localhost:8000/v1")
+        assert responder.check_reachable(transport=self._transport(handler)) == ["pyine-organism"]
+
+    def test_dead_server_raises_with_the_url(self):
+        def handler(request):
+            raise httpx.ConnectError("[Errno 111] Connection refused")
+
+        responder = responder_mod.Responder("vllm:pyine-organism@http://localhost:8000/v1")
+        with pytest.raises(RuntimeError, match="http://localhost:8000/v1/models"):
+            responder.check_reachable(transport=self._transport(handler))
+
+    def test_wrong_served_name_raises_listing_what_is_served(self):
+        def handler(request):
+            return httpx.Response(200, json={"data": [{"id": "Qwen/Qwen3-4B"}]})
+
+        responder = responder_mod.Responder("vllm:pyine-organism@http://localhost:8000/v1")
+        with pytest.raises(RuntimeError, match="Qwen/Qwen3-4B"):
+            responder.check_reachable(transport=self._transport(handler))
+
+    def test_hosted_catalogue_only_needs_to_answer(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+        def handler(request):
+            assert request.url.host == "openrouter.ai"
+            assert request.headers["authorization"] == "Bearer sk-test"
+            return httpx.Response(200, json={"data": [{"id": "something/else"}]})
+
+        responder = responder_mod.Responder("openrouter:openai/gpt-5-mini")
+        responder.check_reachable(transport=self._transport(handler))  # model id not enforced for catalogues

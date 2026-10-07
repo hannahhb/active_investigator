@@ -10,15 +10,18 @@ A responder is described by a short spec string so the same code path covers bot
 from __future__ import annotations
 
 import dataclasses
+import os
 import pathlib
 import typing
 
+import httpx
 import langchain_core.messages
 import pyine.utils.langchain as pyine_langchain
 import pyine.utils.llm_providers as llm_providers
 
 PROMPTS_DIR = pathlib.Path(__file__).resolve().parent.parent / "prompts"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,6 +113,44 @@ class Responder:
         )
         text = message.content if isinstance(message.content, str) else str(message.content)
         return Reply(text=text, completion_tokens=pyine_langchain.extract_token_count_from_handler(handler))
+
+    def check_reachable(
+        self,
+        timeout_seconds: float = 5.0,
+        transport: httpx.BaseTransport | None = None,
+    ) -> list[str]:
+        """Confirm the server answers before any data is loaded or traced.
+
+        Lists the server's models with one cheap GET. A dead local server fails here in a second
+        rather than after minutes of tracing. For a vLLM server the served model name must be in
+        the list, which catches a ``--served-model-name`` mismatch; hosted catalogues are only
+        checked for being reachable. Returns the model ids seen.
+
+        Raises:
+            RuntimeError: when the server cannot be reached, rejects the request, or (vLLM) does
+                not serve the requested model.
+        """
+        base_url = (self.spec.base_url or os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL).rstrip("/")
+        url = f"{base_url}/models"
+        api_key = "EMPTY" if self.spec.provider == "vllm" else os.environ.get("OPENAI_API_KEY", "")
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        try:
+            with httpx.Client(timeout=timeout_seconds, transport=transport) as client:
+                response = client.get(url, headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                f"responder {self.spec.describe()} is not reachable: GET {url} failed ({exc!r}). "
+                "Is the server running on that host and port?"
+            ) from exc
+        ids = [str(item.get("id", "")) for item in payload.get("data", [])]
+        if self.spec.provider == "vllm" and self.spec.model not in ids:
+            raise RuntimeError(
+                f"server at {base_url} is up but does not serve {self.spec.model!r}; it serves {ids}. "
+                "Check --served-model-name."
+            )
+        return ids
 
     @property
     def llm(self) -> typing.Any:
