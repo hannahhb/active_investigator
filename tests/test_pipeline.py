@@ -1,6 +1,6 @@
-import active_investigator.investigator.pickers as pickers
-import active_investigator.investigator.questions as questions
-import active_investigator.investigator.scorer as scorer_mod
+import active_investigator.pickers as pickers
+import active_investigator.questions as questions
+import active_investigator.scorer as scorer_mod
 
 
 class TestFixedPicker:

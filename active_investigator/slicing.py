@@ -13,7 +13,7 @@ import ast
 import collections
 import functools
 
-import active_investigator.investigator.tracing as tracing
+import active_investigator.tracing as tracing
 
 _COMPOUND = (ast.If, ast.While, ast.For)
 

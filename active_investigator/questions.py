@@ -16,8 +16,8 @@ from __future__ import annotations
 import dataclasses
 import typing
 
-import active_investigator.investigator.slicing as slicing
-import active_investigator.investigator.tracing as tracing
+import active_investigator.slicing as slicing
+import active_investigator.tracing as tracing
 
 QuestionKind = typing.Literal["value_at", "branch_at", "execution_count"]
 _BRANCH_PREFIXES = ("if ", "elif ", "while ", "for ")

@@ -15,10 +15,10 @@ import typing
 
 import pyine.evals.correctness.types as correctness_types
 
-import active_investigator.investigator.grading as grading
-import active_investigator.investigator.questions as questions
-import active_investigator.investigator.responder as responder_mod
-import active_investigator.investigator.tracing as tracing
+import active_investigator.grading as grading
+import active_investigator.questions as questions
+import active_investigator.responder as responder_mod
+import active_investigator.tracing as tracing
 
 
 @dataclasses.dataclass

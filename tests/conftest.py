@@ -1,8 +1,8 @@
 import pyine.evals.correctness.types as correctness_types
 import pytest
 
-import active_investigator.investigator.responder as responder_mod
-import active_investigator.investigator.tracing as tracing
+import active_investigator.responder as responder_mod
+import active_investigator.tracing as tracing
 
 PROCESS_SRC = """def process(nums):
     total = 0

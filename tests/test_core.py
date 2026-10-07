@@ -1,6 +1,6 @@
-import active_investigator.investigator.grading as grading
-import active_investigator.investigator.questions as questions
-import active_investigator.investigator.slicing as slicing
+import active_investigator.grading as grading
+import active_investigator.questions as questions
+import active_investigator.slicing as slicing
 
 
 class TestTracing:
@@ -105,7 +105,7 @@ CRASHING_SRC = """def f(xs):
 
 class TestWriteFiltering:
     def test_imported_modules_are_not_candidates(self):
-        import active_investigator.investigator.tracing as tracing
+        import active_investigator.tracing as tracing
 
         bundle = tracing.trace_code(IMPORT_SRC, '{"r": 2}', "area")
         names = {name for step in bundle.steps for name in step.writes}
@@ -115,8 +115,8 @@ class TestWriteFiltering:
     def test_crashed_program_has_no_return_cap_but_keeps_steps(self):
         import pyine.evals.correctness.types as ct
 
-        import active_investigator.investigator.pickers as pickers
-        import active_investigator.investigator.tracing as tracing
+        import active_investigator.pickers as pickers
+        import active_investigator.tracing as tracing
 
         bundle = tracing.trace_code(CRASHING_SRC, '{"xs": [1, 2, 3]}', "f")
         assert bundle.exception is not None
@@ -150,14 +150,14 @@ print(total)
 
 class TestScripts:
     def test_string_none_entrypoint_means_script(self):
-        import active_investigator.investigator.tracing as tracing
+        import active_investigator.tracing as tracing
 
         assert tracing.normalize_entrypoint("None") is None
         assert tracing.normalize_entrypoint("") is None
         assert tracing.normalize_entrypoint("Solution.longest") == "Solution.longest"
 
     def test_stdin_script_traces_with_mocked_input(self):
-        import active_investigator.investigator.tracing as tracing
+        import active_investigator.tracing as tracing
 
         bundle = tracing.trace_record({"code": SCRIPT_SRC, "inputs": "3\n1\n2\n4\n", "entrypoint": "None"})
         assert bundle.exception is None

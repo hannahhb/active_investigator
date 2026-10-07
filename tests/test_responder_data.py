@@ -1,7 +1,7 @@
 import pytest
 
-import active_investigator.investigator.data as data
-import active_investigator.investigator.responder as responder_mod
+import active_investigator.data as data
+import active_investigator.responder as responder_mod
 
 
 class TestProviderSpec:

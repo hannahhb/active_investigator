@@ -17,12 +17,12 @@ import typing
 import dotenv
 import pyine.evals.correctness.types as correctness_types
 
-import active_investigator.investigator.data as data
-import active_investigator.investigator.metrics as metrics
-import active_investigator.investigator.pickers as pickers
-import active_investigator.investigator.responder as responder_mod
-import active_investigator.investigator.scorer as scorer_mod
-import active_investigator.investigator.tracing as tracing
+import active_investigator.data as data
+import active_investigator.metrics as metrics
+import active_investigator.pickers as pickers
+import active_investigator.responder as responder_mod
+import active_investigator.scorer as scorer_mod
+import active_investigator.tracing as tracing
 
 logger = logging.getLogger("investigator")
 ARMS = ("fixed", "prompted", "ranked")
@@ -181,7 +181,7 @@ def main(argv: list[str] | None = None) -> None:
     """Parse arguments and dispatch."""
     dotenv.load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    parser = argparse.ArgumentParser(prog="investigator")
+    parser = argparse.ArgumentParser(prog="active-investigator")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_model_args(p: argparse.ArgumentParser) -> None:

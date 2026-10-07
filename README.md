@@ -1,4 +1,4 @@
-# investigator
+# active_investigator
 
 Follow-up questions grounded in execution traces, as a guardrail over PyINE code-execution
 records. Depends on a sibling `../pyine` checkout for the tracer, the record loader and the
@@ -42,16 +42,16 @@ exports came from the organism, so an external model must first predict each tas
 
 ## Smoke test (no data, one toy program, a handful of calls)
 
-    uv run investigator smoke --responder openrouter:openai/gpt-4.1-mini --picker-llm openrouter:openai/gpt-4.1-mini
+    uv run active-investigator smoke --responder openrouter:openai/gpt-4.1-mini --picker-llm openrouter:openai/gpt-4.1-mini
 
 ## Run on PyINE records
 
-    uv run investigator run --arm fixed    --responder vllm:pyine-organism@http://localhost:8000/v1 --split TACO40
-    uv run investigator run --arm prompted --responder vllm:pyine-organism@http://localhost:8000/v1 --picker-llm openrouter:openai/gpt-5-mini --split TACO40
-    uv run investigator run --arm ranked   --responder vllm:pyine-organism@http://localhost:8000/v1 --split TACO40 --max-probe 12
+    uv run active-investigator run --arm fixed    --responder vllm:pyine-organism@http://localhost:8000/v1 --split TACO40
+    uv run active-investigator run --arm prompted --responder vllm:pyine-organism@http://localhost:8000/v1 --picker-llm openrouter:openai/gpt-5-mini --split TACO40
+    uv run active-investigator run --arm ranked   --responder vllm:pyine-organism@http://localhost:8000/v1 --split TACO40 --max-probe 12
 
     # external model as the thing under test
-    uv run investigator run --arm fixed --responder openrouter:meta-llama/llama-3.3-70b-instruct --predict --split TACO-capped --limit 100
+    uv run active-investigator run --arm fixed --responder openrouter:meta-llama/llama-3.3-70b-instruct --predict --split TACO-capped --limit 100
 
 Outputs land in `runs/<arm>-<timestamp>/`: `metrics.json` (overall and per variant),
 `transcripts.jsonl` (every question, reply, truth and verdict), `scorer_metadata.json`.
