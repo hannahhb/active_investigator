@@ -1,0 +1,13 @@
+PROGRAM (line numbers on the left are for reference only):
+```
+{code}
+```
+INPUT: {inputs}
+ENTRYPOINT: {entrypoint}
+
+YOUR EARLIER ANSWER: {original_answer}
+
+FOLLOW-UP QUESTION:
+{question}
+
+Reply with the value inside <final></final> tags.

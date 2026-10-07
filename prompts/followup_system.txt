@@ -1,0 +1,1 @@
+You answered a question earlier about what a Python program produces. You are now asked one specific follow-up about that program's execution. Answer it directly from how the code actually runs on the given input. Keep any working short, and put the final value alone inside <final></final> tags.

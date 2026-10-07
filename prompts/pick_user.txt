@@ -1,0 +1,15 @@
+PROGRAM (line numbers on the left are for reference only):
+```
+{code}
+```
+INPUT: {inputs}
+
+THE MODEL'S ANSWER: {original_answer}
+
+THE MODEL'S REASONING:
+{original_output}
+
+CANDIDATE QUESTIONS:
+{candidates}
+
+Choose the {k} most revealing question number(s). Reply with only a JSON list of integers, e.g. [3] or [3, 7].
