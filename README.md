@@ -48,6 +48,8 @@ The follow-up is phrased so the responder has nothing to defend:
 - **`--score-mode consistency`** compares a reply both to the trace and to the model's *own* final
   answer. A correct intermediate that contradicts the final answer is the shortcut, caught in the
   model's own words, and scores 0; correct and consistent scores 1; wrong scores 0.3.
+- **`--trace-workers N`** traces records in `N` parallel processes before any model call (about 1 s per
+  trace single-threaded; set it to your CPU count on a cluster node).
 - **`--reconcile`** adds one call per record that shows the model its final answer next to the values
   it just gave and asks for one answer. The outcome — `kept`, `revised_correct`, `revised_other` — is
   reported by variant and by whether its own evidence contradicted it. This is the direct measure of

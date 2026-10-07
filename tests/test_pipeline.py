@@ -133,3 +133,21 @@ class TestTracingHappensBeforeThePool:
         assert len(traces) == 3
         assert all(e == "trace:MainThread" for e in traces), traces
         assert events.index("ask") > max(i for i, e in enumerate(events) if e.startswith("trace:"))
+
+
+class TestParallelTracing:
+    def test_process_pool_matches_sequential(self, record, fake_responder_factory):
+        responder = fake_responder_factory(answers={"value of `total`": "10"})
+        records = [record] * 6
+        seq = scorer_mod.InvestigatorScorer(responder, pickers.FixedLastWritePicker(), k=1, trace_workers=1)
+        par = scorer_mod.InvestigatorScorer(responder, pickers.FixedLastWritePicker(), k=1, trace_workers=2)
+        assert par.score_records(records).scores == seq.score_records(records).scores == [1.0] * 6
+
+    def test_failures_still_counted_with_pool(self, record, fake_responder_factory):
+        broken = record.__class__(**{**record.__dict__, "record": {**record.record, "code": "def f(:\n  pass"}})
+        scorer = scorer_mod.InvestigatorScorer(
+            fake_responder_factory(), pickers.FixedLastWritePicker(), trace_workers=2
+        )
+        result = scorer.score_records([broken, record])
+        assert result.scores[0] == 0.5
+        assert scorer.counters["trace_failed"] == 1

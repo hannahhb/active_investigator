@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import functools
 import logging
 import statistics
 import threading
@@ -71,6 +72,25 @@ class Prepared:
     """Set when the record cannot be investigated at all; the pool returns it untouched."""
 
 
+def prepare_record(
+    record: correctness_types.EvalRecord,
+    kinds: tuple[questions.QuestionKind, ...],
+    timeout_seconds: float,
+    default_score: float,
+) -> Prepared:
+    """Trace one record and enumerate its questions. Module-level so it can run in a worker process."""
+    if record.final_answer is None:
+        return Prepared(None, [], Outcome(0.0, 0.0, {"outcome": "missing_original_answer"}))
+    try:
+        bundle = tracing.trace_record(record.record, timeout_seconds=timeout_seconds)
+    except Exception as exc:  # tracing arbitrary programs can fail; record why rather than crash the run
+        return Prepared(None, [], Outcome(default_score, 0.0, {"outcome": "trace_failed", "error": repr(exc)[:300]}))
+    candidates = questions.generate_candidates(bundle, kinds=kinds)
+    if not candidates:
+        return Prepared(bundle, [], Outcome(default_score, 0.0, {"outcome": "no_candidates"}))
+    return Prepared(bundle, candidates, None)
+
+
 class InvestigatorScorer:
     """GuardrailScorer that asks trace-grounded follow-ups and grades them mechanically."""
 
@@ -86,6 +106,7 @@ class InvestigatorScorer:
         strip_hints: bool = False,
         score_mode: ScoreMode = "correct",
         reconcile: bool = False,
+        trace_workers: int = 1,
     ) -> None:
         """Wire a responder and a picker together under a fixed per-record question budget.
 
@@ -109,6 +130,7 @@ class InvestigatorScorer:
         self._kinds = tuple(question_kinds)
         self._default = default_score_on_error
         self._trace_timeout = trace_timeout_seconds
+        self._trace_workers = trace_workers
         self._system = responder_mod.load_prompt("followup_system.txt")
         self._user = responder_mod.load_prompt("followup_user.txt")
         self._lock = threading.Lock()
@@ -125,7 +147,7 @@ class InvestigatorScorer:
         records: list[correctness_types.EvalRecord],
     ) -> correctness_types.ScoringResult:
         """Score every record; one metadata entry per record, including failures."""
-        prepared = [self._prepare(record, idx, len(records)) for idx, record in enumerate(records)]
+        prepared = self._prepare_all(records)
         outcomes: list[Outcome | None] = [None] * len(records)
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as pool:
             futures = {
@@ -149,29 +171,36 @@ class InvestigatorScorer:
         with self._lock:
             self.counters[key] += 1
 
-    def _prepare(
+    def _prepare_all(
         self,
-        record: correctness_types.EvalRecord,
-        idx: int,
-        total: int,
-    ) -> Prepared:
-        """Trace one record and enumerate its questions; runs on the calling thread, before the pool."""
-        if record.final_answer is None:
-            return Prepared(None, [], Outcome(0.0, 0.0, {"outcome": "missing_original_answer"}))
-        try:
-            bundle = tracing.trace_record(record.record, timeout_seconds=self._trace_timeout)
-        except Exception as exc:  # tracing arbitrary programs can fail; record why rather than crash the run
-            self._bump("trace_failed")
-            return Prepared(
-                None, [], Outcome(self._default, 0.0, {"outcome": "trace_failed", "error": repr(exc)[:300]})
-            )
-        candidates = questions.generate_candidates(bundle, kinds=self._kinds)
-        if not candidates:
-            self._bump("no_candidates")
-            return Prepared(bundle, [], Outcome(self._default, 0.0, {"outcome": "no_candidates"}))
-        if (idx + 1) % 500 == 0:
-            logger.info("traced %d/%d records", idx + 1, total)
-        return Prepared(bundle, candidates, None)
+        records: list[correctness_types.EvalRecord],
+    ) -> list[Prepared]:
+        """Trace every record before any worker thread exists, in parallel processes when asked.
+
+        Forking worker processes here is safe because no threads are running yet; each worker
+        then runs the tracer, which forks its own sandboxed child. Counters are tallied in the
+        parent from the returned outcomes so nothing is shared across processes.
+        """
+        job = functools.partial(
+            prepare_record, kinds=self._kinds, timeout_seconds=self._trace_timeout, default_score=self._default
+        )
+        prepared: list[Prepared] = []
+        if self._trace_workers > 1:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=self._trace_workers) as pool:
+                iterator = pool.map(job, records, chunksize=4)
+                for idx, item in enumerate(iterator, start=1):
+                    prepared.append(item)
+                    if idx % 50 == 0 or idx == len(records):
+                        logger.info("traced %d/%d records", idx, len(records))
+        else:
+            for idx, record in enumerate(records, start=1):
+                prepared.append(job(record))
+                if idx % 50 == 0 or idx == len(records):
+                    logger.info("traced %d/%d records", idx, len(records))
+        for item in prepared:
+            if item.failure is not None and item.failure.metadata.get("outcome") in self.counters:
+                self._bump(item.failure.metadata["outcome"])
+        return prepared
 
     def _score_single(
         self,

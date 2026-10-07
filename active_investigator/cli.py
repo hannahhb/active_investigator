@@ -120,6 +120,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         strip_hints=args.strip_hints,
         score_mode=args.score_mode,
         reconcile=args.reconcile,
+        trace_workers=args.trace_workers,
     )
     result = scorer.score_records(records)
     out_dir = pathlib.Path(args.out or f"runs/{args.arm}-{datetime.datetime.now():%Y%m%d_%H%M%S}")
@@ -230,7 +231,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--predict", action="store_true", help="regenerate original predictions with the responder")
     run.add_argument("--kinds", default="value_at,branch_at,execution_count")
-    run.add_argument("--max-workers", type=int, default=8)
+    run.add_argument("--max-workers", type=int, default=8, help="concurrent model calls")
+    run.add_argument("--trace-workers", type=int, default=1, help="processes for the tracing pass (try your CPU count)")
     run.add_argument("--rps", type=float, default=None, help="rate limit per model, requests per second")
     run.add_argument("--out", default=None)
     run.set_defaults(func=cmd_run)
@@ -247,6 +249,7 @@ def main(argv: list[str] | None = None) -> None:
     """Parse arguments and dispatch."""
     dotenv.load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("pyine.utils.reprod").setLevel(logging.WARNING)  # one "setting seed" line per trace otherwise
     args = build_parser().parse_args(argv)
     args.func(args)
 
