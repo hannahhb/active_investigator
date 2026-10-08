@@ -1,3 +1,5 @@
+import json
+
 import active_investigator.pickers as pickers
 import active_investigator.questions as questions
 import active_investigator.scorer as scorer_mod
@@ -232,3 +234,40 @@ class TestTraceCache:
         assert len(traced) == 1
         assert next(iter(traced.values())).failure is None
         assert len(list(tmp_path.glob("*.pkl"))) == 1
+
+
+class TestProgressLog:
+    def _records(self, record, n):
+        import dataclasses
+
+        return [dataclasses.replace(record, attempt_index=i) for i in range(n)]
+
+    def test_each_record_is_written_as_it_finishes(self, record, fake_responder_factory, tmp_path):
+        log = scorer_mod.ProgressLog(tmp_path / "transcripts.jsonl")
+        responder = fake_responder_factory(answers={"value of `total`": "10"})
+        scorer = scorer_mod.InvestigatorScorer(responder, pickers.FixedLastWritePicker(), k=1, progress=log)
+        scorer.score_records(self._records(record, 3))
+        lines = [json.loads(row) for row in (tmp_path / "transcripts.jsonl").read_text().splitlines()]
+        assert sorted(row["attempt_index"] for row in lines) == [0, 1, 2]
+        assert all(row["score"] == 1.0 and row["outcome"] == "ok" for row in lines)
+        assert {"sample_id", "code_type", "label", "cost", "original_answer", "expected_output"} <= set(lines[0])
+
+    def test_rerun_skips_finished_records(self, record, fake_responder_factory, tmp_path):
+        log = scorer_mod.ProgressLog(tmp_path / "transcripts.jsonl")
+        first = fake_responder_factory(answers={"value of `total`": "10"})
+        scorer_mod.InvestigatorScorer(first, pickers.FixedLastWritePicker(), k=1, progress=log).score_records(
+            self._records(record, 2)
+        )
+        second = fake_responder_factory(answers={"value of `total`": "10"})
+        scorer = scorer_mod.InvestigatorScorer(second, pickers.FixedLastWritePicker(), k=1, progress=log)
+        result = scorer.score_records(self._records(record, 4))
+        assert len(second.calls) == 2  # only the two new records were asked
+        assert result.scores == [1.0] * 4
+        assert scorer.counters["resumed"] == 2
+        assert len((tmp_path / "transcripts.jsonl").read_text().splitlines()) == 4
+
+    def test_truncated_last_line_is_redone_not_crashed(self, record, fake_responder_factory, tmp_path):
+        path = tmp_path / "transcripts.jsonl"
+        path.write_text('{"sample_id": "x", "attempt_index": 0, "score": 1.0, "co')  # killed mid-write
+        log = scorer_mod.ProgressLog(path)
+        assert log.load() == {}

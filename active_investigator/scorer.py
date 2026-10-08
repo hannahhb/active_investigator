@@ -199,6 +199,77 @@ def prepare_programs(
     return traced
 
 
+RecordKey = tuple[str, int]
+"""(sample_id, attempt_index): unique per record, since sample_id already carries the variant."""
+
+
+def record_key(record: correctness_types.EvalRecord) -> RecordKey:
+    """Identity of one record inside a run, used to resume."""
+    return (record.sample_id, record.attempt_index)
+
+
+_LINE_FIELDS = (
+    "sample_id",
+    "attempt_index",
+    "code_type",
+    "label",
+    "score",
+    "cost",
+    "original_answer",
+    "expected_output",
+)
+
+
+class ProgressLog:
+    """Append-only ``transcripts.jsonl``: one line per record, written the moment that record finishes.
+
+    A later run pointed at the same file loads the finished records and skips them, so a run that
+    dies halfway (Colab recycling, a server going down) loses nothing already done.
+    """
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    def load(self) -> dict[RecordKey, Outcome]:
+        """Finished records from an earlier run, or an empty dict when starting fresh."""
+        done: dict[RecordKey, Outcome] = {}
+        if not self.path.exists():
+            return done
+        with self.path.open() as handle:
+            for raw in handle:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    line = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue  # a line cut short by a kill; the record will simply be redone
+                metadata = {k: v for k, v in line.items() if k not in _LINE_FIELDS}
+                done[(line["sample_id"], line["attempt_index"])] = Outcome(line["score"], line["cost"] or 0.0, metadata)
+        return done
+
+    def append(self, record: correctness_types.EvalRecord, outcome: Outcome) -> None:
+        """Write one finished record and flush, so it survives whatever happens next."""
+        line = {
+            "sample_id": record.sample_id,
+            "attempt_index": record.attempt_index,
+            "code_type": record.code_type,
+            "label": record.label,
+            "score": outcome.score,
+            "cost": outcome.cost,
+            "original_answer": record.final_answer,
+            "expected_output": record.expected_output,
+            **outcome.metadata,
+        }
+        text = json.dumps(line, default=str) + "\n"
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a") as handle:
+                handle.write(text)
+                handle.flush()
+
+
 class InvestigatorScorer:
     """GuardrailScorer that asks trace-grounded follow-ups and grades them mechanically."""
 
@@ -216,6 +287,7 @@ class InvestigatorScorer:
         reconcile: bool = False,
         trace_workers: int = 1,
         trace_cache: pathlib.Path | str | None = None,
+        progress: ProgressLog | None = None,
     ) -> None:
         """Wire a responder and a picker together under a fixed per-record question budget.
 
@@ -228,6 +300,7 @@ class InvestigatorScorer:
                 keeps, corrects, or changes its final answer. One extra call per record.
             trace_cache: Directory where traced programs are kept between runs. Any run (any arm)
                 over the same programs then skips straight to the asking phase.
+            progress: Live log of finished records; records already in it are not redone.
         """
         self._responder = responder
         self._picker = picker
@@ -243,6 +316,7 @@ class InvestigatorScorer:
         self._trace_timeout = trace_timeout_seconds
         self._trace_workers = trace_workers
         self._trace_cache = pathlib.Path(trace_cache) if trace_cache else None
+        self._progress = progress
         self._system = responder_mod.load_prompt("followup_system.txt")
         self._user = responder_mod.load_prompt("followup_user.txt")
         self._lock = threading.Lock()
@@ -253,22 +327,47 @@ class InvestigatorScorer:
             "picker_empty": 0,
             "ask_failed": 0,
             "trace_cache_hits": 0,
+            "resumed": 0,
         }
 
     def score_records(
         self,
         records: list[correctness_types.EvalRecord],
     ) -> correctness_types.ScoringResult:
-        """Score every record; one metadata entry per record, including failures."""
-        prepared = self._prepare_all(records)
+        """Score every record; one metadata entry per record, including failures.
+
+        Records already present in the progress log are taken from it; the rest are traced, scored,
+        and appended to the log one by one as they finish.
+        """
         outcomes: list[Outcome | None] = [None] * len(records)
+        if self._progress is not None:
+            done = self._progress.load()
+            for idx, record in enumerate(records):
+                if (earlier := done.get(record_key(record))) is not None:
+                    outcomes[idx] = earlier
+                    if earlier.metadata.get("outcome") in self.counters:
+                        self._bump(earlier.metadata["outcome"])
+            resumed = sum(outcome is not None for outcome in outcomes)
+            self.counters["resumed"] += resumed
+            if resumed:
+                logger.info("resuming: %d of %d records already done in %s", resumed, len(records), self._progress.path)
+        todo = [idx for idx, outcome in enumerate(outcomes) if outcome is None]
+        prepared = self._prepare_all([records[idx] for idx in todo])
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as pool:
             futures = {
-                pool.submit(self._score_single, record, prep): idx
-                for idx, (record, prep) in enumerate(zip(records, prepared, strict=True))
+                pool.submit(self._score_single, records[idx], prep): idx
+                for idx, prep in zip(todo, prepared, strict=True)
             }
+            finished = 0
             for future in concurrent.futures.as_completed(futures):
-                outcomes[futures[future]] = future.result()
+                idx = futures[future]
+                outcome = future.result()
+                outcomes[idx] = outcome
+                if self._progress is not None:
+                    self._progress.append(records[idx], outcome)
+                finished += 1
+                if finished % 50 == 0 or finished == len(todo):
+                    logger.info("scored %d/%d records", finished, len(todo))
         scores, costs = [], []
         metadata: dict[correctness_types.ScoredAttemptKey, dict[str, typing.Any]] = {}
         for idx, outcome in enumerate(outcomes):
@@ -438,6 +537,7 @@ class InvestigatorScorer:
             "reconcile": self._reconcile,
             "responder": self._responder.spec.describe(),
             "trace_cache": str(self._trace_cache) if self._trace_cache else None,
+            "progress_log": str(self._progress.path) if self._progress else None,
             **self.counters,
         }
 

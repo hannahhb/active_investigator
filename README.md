@@ -57,6 +57,10 @@ The follow-up is phrased so the responder has nothing to defend:
   Tracing needs no GPU, so fill the cache on a laptop and copy the directory next to the GPU run:
 
       uv run active-investigator run --trace-only --trace-cache traces -p 40 --trace-workers 8
+- **Progress is saved live.** Each record's result is appended to `transcripts.jsonl` in the output
+  folder the moment it finishes. Rerun the same command with the same `--out` after a crash or a
+  recycled Colab runtime and it resumes, redoing only what is missing (the folder's `args.json` is
+  checked so you cannot resume into a run made with other settings).
 - **Servers are checked before anything else.** The run lists the responder's (and picker's) models
   with one request and stops with a clear message if a server is down or serves a different model
   name, instead of tracing for minutes and then failing every record.

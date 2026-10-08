@@ -50,39 +50,55 @@ def build_picker(
     raise SystemExit(f"unknown arm {arm!r}; choose from {ARMS}")
 
 
+RUN_SETTINGS = (
+    "arm",
+    "responder",
+    "picker_llm",
+    "k",
+    "max_probe",
+    "min_steps",
+    "strip_hints",
+    "score_mode",
+    "reconcile",
+    "split",
+    "subset",
+    "lmdb",
+    "problems",
+    "limit",
+    "seed",
+    "predict",
+    "kinds",
+)
+"""Settings that must match for a rerun to resume into an existing output folder."""
+
+
+def _open_run_dir(args: argparse.Namespace) -> tuple[pathlib.Path, scorer_mod.ProgressLog]:
+    """Create (or reopen) the output folder and refuse to resume into a run made with other settings."""
+    out_dir = pathlib.Path(args.out or f"runs/{args.arm}-{datetime.datetime.now():%Y%m%d_%H%M%S}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    args_path = out_dir / "args.json"
+    wanted = {key: getattr(args, key) for key in RUN_SETTINGS}
+    if args_path.exists():
+        earlier = json.loads(args_path.read_text())
+        clashes = {k: (earlier.get(k), v) for k, v in wanted.items() if earlier.get(k) != v}
+        if clashes:
+            raise SystemExit(
+                f"{out_dir} holds a run with different settings {clashes}; pick another --out or delete it"
+            )
+    args_path.write_text(json.dumps(vars(args), indent=2, default=str))
+    return out_dir, scorer_mod.ProgressLog(out_dir / "transcripts.jsonl")
+
+
 def _write_outputs(
     out_dir: pathlib.Path,
     records: list[correctness_types.EvalRecord],
     result: correctness_types.ScoringResult,
     scorer: scorer_mod.InvestigatorScorer,
-    args: argparse.Namespace,
 ) -> dict[str, typing.Any]:
-    out_dir.mkdir(parents=True, exist_ok=True)
+    """Write the summary files; transcripts were already written live, one line per record."""
     summary = metrics.summarize(records, result.scores, result.verification_costs)
     (out_dir / "metrics.json").write_text(json.dumps(summary, indent=2))
     (out_dir / "scorer_metadata.json").write_text(json.dumps(scorer.get_metadata(), indent=2))
-    (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2, default=str))
-    with (out_dir / "transcripts.jsonl").open("w") as handle:
-        assert result.attempt_metadata is not None
-        for (sample_id, attempt_index, draw_index), payload in result.attempt_metadata.items():
-            record = records[draw_index]
-            handle.write(
-                json.dumps(
-                    {
-                        "sample_id": sample_id,
-                        "attempt_index": attempt_index,
-                        "code_type": record.code_type,
-                        "label": record.label,
-                        "score": result.scores[draw_index],
-                        "cost": result.verification_costs[draw_index] if result.verification_costs else None,
-                        "original_answer": record.final_answer,
-                        "expected_output": record.expected_output,
-                        **payload,
-                    },
-                    default=str,
-                )
-                + "\n"
-            )
     return summary
 
 
@@ -152,6 +168,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         max_problems=args.problems,
     )
     logger.info("loaded %d records from %s/%s", len(records), args.split, args.subset)
+    out_dir, progress = _open_run_dir(args)
     if args.predict:
         logger.info("regenerating original predictions with %s", responder.spec.describe())
         records = data.regenerate_predictions(records, responder)
@@ -167,10 +184,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         reconcile=args.reconcile,
         trace_workers=args.trace_workers,
         trace_cache=args.trace_cache,
+        progress=progress,
     )
     result = scorer.score_records(records)
-    out_dir = pathlib.Path(args.out or f"runs/{args.arm}-{datetime.datetime.now():%Y%m%d_%H%M%S}")
-    summary = _write_outputs(out_dir, records, result, scorer, args)
+    summary = _write_outputs(out_dir, records, result, scorer)
     print(metrics.format_summary(summary))
     if args.reconcile and result.attempt_metadata:
         print("\nreconcile: what the model did when shown its own values")
