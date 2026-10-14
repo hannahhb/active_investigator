@@ -20,9 +20,9 @@ import typing
 import httpx
 import langchain_core.messages
 import openai
-import pyine.utils.parsing as pyine_parsing
 import pyine.utils.langchain as pyine_langchain
 import pyine.utils.llm_providers as llm_providers
+import pyine.utils.parsing as pyine_parsing
 
 PROMPTS_DIR = pathlib.Path(__file__).resolve().parent.parent / "prompts"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"

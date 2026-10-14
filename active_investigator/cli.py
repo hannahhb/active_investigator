@@ -25,7 +25,7 @@ import active_investigator.scorer as scorer_mod
 import active_investigator.tracing as tracing
 
 logger = logging.getLogger("investigator")
-ARMS = ("fixed", "on_path", "prompted", "ranked")
+ARMS = ("fixed", "on_path", "prompted", "ranked", *pickers.QUESTION_TYPES)
 
 
 def build_picker(
@@ -47,10 +47,16 @@ def build_picker(
         return pickers.PromptedPicker(picker_llm, min_steps=min_steps)
     if arm == "ranked":
         return pickers.RankedPicker(responder, max_probe=max_probe, strip=strip)
+    if arm in pickers.QUESTION_TYPES:
+        return pickers.QuestionTypePicker(arm, min_steps=min_steps)
     raise SystemExit(f"unknown arm {arm!r}; choose from {ARMS}")
 
 
 RUN_SETTINGS = (
+    "force_answer",
+    "responder_reasoning",
+    "attempts",
+    "predict_temperature",
     "arm",
     "responder",
     "picker_llm",
@@ -141,6 +147,40 @@ def _trace_only(args: argparse.Namespace) -> None:
     )
 
 
+def _responder(args: argparse.Namespace) -> responder_mod.Responder:
+    """The model under test, with forcing and reasoning set from the flags."""
+    return responder_mod.Responder(
+        args.responder,
+        max_tokens=args.responder_max_tokens,
+        requests_per_second=getattr(args, "rps", None),
+        force_answer=args.force_answer,
+        reasoning=args.responder_reasoning,
+    )
+
+
+def _forcing_report(
+    records: list[correctness_types.EvalRecord],
+    result: correctness_types.ScoringResult,
+) -> dict[str, typing.Any]:
+    """How many answers were forced, and the summary as if forcing had been off."""
+    assert result.attempt_metadata is not None
+    by_idx = {draw: payload for (_, _, draw), payload in result.attempt_metadata.items()}
+    payloads = [by_idx[idx] for idx in range(len(records))]
+    counts: dict[str, dict[str, int]] = {}
+    for record, payload in zip(records, payloads, strict=True):
+        row = counts.setdefault(record.code_type, {"questions": 0, "forced": 0, "reconcile_forced": 0})
+        row["questions"] += len(payload.get("asked", []))
+        row["forced"] += payload.get("forced", 0)
+        row["reconcile_forced"] += int(bool((payload.get("reconcile") or {}).get("forced")))
+    unforced = [payload.get("score_unforced", score) for payload, score in zip(payloads, result.scores, strict=True)]
+    self_cons = [payload.get("score_self_consistency", 0.5) for payload in payloads]
+    return {
+        "forced_counts": counts,
+        "without_forcing": metrics.summarize(records, unforced, result.verification_costs),
+        "self_consistency_only": metrics.summarize(records, self_cons, result.verification_costs),
+    }
+
+
 def cmd_run(args: argparse.Namespace) -> None:
     """Score records from the PyINE exports with the chosen arm."""
     if args.trace_only:
@@ -148,11 +188,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         return
     if not args.responder or not args.arm:
         raise SystemExit("--responder and --arm are required (unless --trace-only)")
-    responder = responder_mod.Responder(
-        args.responder,
-        max_tokens=args.responder_max_tokens,
-        requests_per_second=args.rps,
-    )
+    responder = _responder(args)
     picker_llm = None
     if args.picker_llm:
         picker_llm = responder_mod.Responder(
@@ -166,13 +202,28 @@ def cmd_run(args: argparse.Namespace) -> None:
         limit=args.limit,
         seed=args.seed,
         max_problems=args.problems,
+        max_attempts=args.attempts,
     )
     logger.info("loaded %d records from %s/%s", len(records), args.split, args.subset)
     out_dir, progress = _open_run_dir(args)
     if args.predict:
-        logger.info("regenerating original predictions with %s", responder.spec.describe())
-        records = data.regenerate_predictions(records, responder)
-        logger.info("responder accuracy on regenerated predictions: %.3f", sum(r.label for r in records) / len(records))
+        predictor = responder_mod.Responder(
+            args.responder,
+            max_tokens=args.predict_max_tokens,
+            temperature=args.predict_temperature,
+            requests_per_second=args.rps,
+            reasoning=args.responder_reasoning,
+        )
+        logger.info("regenerating original predictions with %s", predictor.spec.describe())
+        records = data.regenerate_predictions(
+            records, predictor, max_workers=args.max_workers, save_path=out_dir / "predictions.jsonl"
+        )
+        missing = sum(r.final_answer is None for r in records)
+        logger.info(
+            "responder accuracy on regenerated predictions: %.3f (%d with no tagged answer)",
+            sum(r.label for r in records) / len(records),
+            missing,
+        )
     scorer = scorer_mod.InvestigatorScorer(
         responder=responder,
         picker=build_picker(args.arm, responder, picker_llm, args.max_probe, args.min_steps, args.strip_hints),
@@ -188,7 +239,19 @@ def cmd_run(args: argparse.Namespace) -> None:
     )
     result = scorer.score_records(records)
     summary = _write_outputs(out_dir, records, result, scorer)
+    extra = _forcing_report(records, result)
+    (out_dir / "metrics_extra.json").write_text(json.dumps(extra, indent=2))
     print(metrics.format_summary(summary))
+    print("\nanswers forced out of replies that hit the token limit, by variant:")
+    for variant, row in sorted(extra["forced_counts"].items()):
+        print(
+            f"  {variant:11s} {row['forced']:5d} of {row['questions']:5d} follow-ups, "
+            f"{row['reconcile_forced']:5d} reconciles"
+        )
+    print("\nscored as if forcing were off:")
+    print(metrics.format_summary(extra["without_forcing"]))
+    print("\nself-consistency only (needs no true values, only the choice of question):")
+    print(metrics.format_summary(extra["self_consistency_only"]))
     if args.reconcile and result.attempt_metadata:
         print("\nreconcile: what the model did when shown its own values")
         print(metrics.format_reconcile(metrics.summarize_reconcile(records, result.attempt_metadata)))
@@ -209,7 +272,7 @@ def cmd_smoke(args: argparse.Namespace) -> None:
     """Run every arm once on a tiny program whose docstring lies about what it does."""
     if not args.responder:
         raise SystemExit("--responder is required")
-    responder = responder_mod.Responder(args.responder, max_tokens=args.responder_max_tokens)
+    responder = _responder(args)
     picker_llm = (
         responder_mod.Responder(args.picker_llm, max_tokens=args.picker_max_tokens) if args.picker_llm else None
     )
@@ -279,6 +342,18 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--score-mode", choices=("correct", "consistency"), default="correct")
         p.add_argument("--reconcile", action="store_true", help="confront the model with its own values afterwards")
         p.add_argument("--picker-max-tokens", type=int, default=8192)
+        p.add_argument(
+            "--no-force-answer",
+            dest="force_answer",
+            action="store_false",
+            help="do not force an answer out of replies that hit the token limit (forcing is on by default)",
+        )
+        p.add_argument(
+            "--responder-reasoning",
+            choices=responder_mod.REASONING_CHOICES,
+            default="default",
+            help="hosted models only: separate reasoning off, or its effort; default leaves the provider setting",
+        )
 
     run = sub.add_parser("run", help="score PyINE records with one arm")
     add_model_args(run)
@@ -298,6 +373,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--limit", type=int, default=None, help="cap records; whole samples are kept together")
     run.add_argument("--seed", type=int, default=0)
     run.add_argument("--predict", action="store_true", help="regenerate original predictions with the responder")
+    run.add_argument("--predict-temperature", type=float, default=0.6, help="sampling temperature for --predict")
+    run.add_argument("--predict-max-tokens", type=int, default=4096, help="token limit for --predict")
+    run.add_argument("--attempts", type=int, default=None, help="keep only the first N attempts of each sample")
     run.add_argument("--kinds", default="value_at,branch_at,execution_count")
     run.add_argument("--max-workers", type=int, default=8, help="concurrent model calls")
     run.add_argument("--trace-workers", type=int, default=1, help="processes for the tracing pass (try your CPU count)")
