@@ -11,9 +11,13 @@ Two situations:
 from __future__ import annotations
 
 import collections
+import concurrent.futures
+import json
 import logging
 import os
+import pathlib
 import random
+import threading
 import typing
 
 import dotenv
@@ -46,11 +50,13 @@ def load_records(
     limit: int | None = None,
     seed: int = 0,
     max_problems: int | None = None,
+    max_attempts: int | None = None,
 ) -> list[correctness_types.EvalRecord]:
     """Load one guardrail subset through PyINE's datamodule, optionally restricted to a few problems.
 
     ``max_problems`` keeps whole problems (every variant and attempt of each), chosen at random
-    with ``seed``; ``limit`` then caps records, keeping whole samples together.
+    with ``seed``; ``max_attempts`` then keeps only the first attempts of each sample; ``limit``
+    finally caps records, keeping whole samples together.
     """
     config = datamodule_configs.CorrectnessDataModuleConfig(
         lmdb_paths=list(lmdb_paths) if lmdb_paths else [default_lmdb_path()],
@@ -67,6 +73,9 @@ def load_records(
         keep = set(problem_ids[:max_problems])
         records = [record for record in records if record.problem_id in keep]
         logger.info("kept %d of %d problems (%d records)", len(keep), len(problem_ids), len(records))
+    if max_attempts is not None:
+        records = [record for record in records if record.attempt_index < max_attempts]
+        logger.info("kept the first %d attempts of each sample (%d records)", max_attempts, len(records))
     if limit is None or limit >= len(records):
         return records
     by_sample: dict[str, list[correctness_types.EvalRecord]] = collections.defaultdict(list)
@@ -85,12 +94,18 @@ def load_records(
 def regenerate_predictions(
     records: list[correctness_types.EvalRecord],
     responder: responder_mod.Responder,
+    max_workers: int = 8,
+    save_path: pathlib.Path | None = None,
 ) -> list[correctness_types.EvalRecord]:
     """Ask the responder to predict each task afresh, using the organism's prediction prompt.
 
     The prompt is ``code_execution`` / ``rl_tagged_answer`` — what the organism was trained with
     — so an external model is asked the task exactly the way the organism was. Labels are
     recomputed against ``expected_output`` with PyINE's soft comparison.
+
+    Predictions run ``max_workers`` at a time. With ``save_path``, each prediction is appended to
+    that JSON-lines file as it finishes and predictions already in it are reused, so a resumed run
+    keeps the original answers its follow-ups were asked about.
     """
     chain = pyine.prompts.manager.get_prompt_chain(
         model=responder.llm,
@@ -99,8 +114,13 @@ def regenerate_predictions(
         use_chat_template=True,
         include_examples=False,
     )
-    out: list[correctness_types.EvalRecord] = []
-    for record in records:
+    saved = _load_predictions(save_path)
+    lock = threading.Lock()
+
+    def predict(record: correctness_types.EvalRecord) -> str:
+        key = f"{record.sample_id}|{record.attempt_index}"
+        if key in saved:
+            return saved[key]
         payload = record.record
         variables = {
             "code": payload["code"],
@@ -116,6 +136,18 @@ def regenerate_predictions(
         }
         handler = pyine_langchain.CaptureLLMHandler()
         model_output = str(chain.invoke(variables, config={"callbacks": [handler]}))
+        if save_path is not None:
+            with lock, save_path.open("a") as handle:
+                handle.write(json.dumps({"key": key, "model_output": model_output}) + "\n")
+                handle.flush()
+        return model_output
+
+    if saved:
+        logger.info("reusing %d saved predictions from %s", len(saved), save_path)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        outputs = list(pool.map(predict, records))
+    out: list[correctness_types.EvalRecord] = []
+    for record, model_output in zip(records, outputs, strict=True):
         final_answer = grading.extract_answer(model_output)
         label = grading.is_correct(final_answer, record.expected_output)
         out.append(
@@ -130,7 +162,22 @@ def regenerate_predictions(
                 code_type=record.code_type,
                 tags=list(record.tags),
                 difficulty_score=record.difficulty_score,
-                record={**payload, "model_output": model_output, "final_answer": final_answer},
+                record={**record.record, "model_output": model_output, "final_answer": final_answer},
             )
         )
     return out
+
+
+def _load_predictions(path: pathlib.Path | None) -> dict[str, str]:
+    """Predictions saved by an earlier, interrupted run; a line cut short by a kill is skipped."""
+    saved: dict[str, str] = {}
+    if path is None or not path.exists():
+        return saved
+    with path.open() as handle:
+        for raw in handle:
+            try:
+                row = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            saved[row["key"]] = row["model_output"]
+    return saved

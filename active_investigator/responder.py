@@ -10,18 +10,44 @@ A responder is described by a short spec string so the same code path covers bot
 from __future__ import annotations
 
 import dataclasses
+import json
+import logging
 import os
 import pathlib
+import threading
 import typing
 
 import httpx
 import langchain_core.messages
+import openai
+import pyine.utils.parsing as pyine_parsing
 import pyine.utils.langchain as pyine_langchain
 import pyine.utils.llm_providers as llm_providers
 
 PROMPTS_DIR = pathlib.Path(__file__).resolve().parent.parent / "prompts"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
+ANSWER_TAG = "final"
+FORCE_PROMPT = "You have run out of space. Stop working now and give only your answer to the question above."
+FORCE_MAX_TOKENS = 256
+"""A forced answer is one short JSON object; this is ample and keeps a stuck model from looping again."""
+ANSWER_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "answer",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+    },
+}
+"""Structured decoding target: vLLM and OpenRouter both constrain the reply to this JSON shape."""
+REASONING_CHOICES = ("default", "off", "low", "medium", "high")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,6 +87,23 @@ class Reply:
 
     text: str
     completion_tokens: float
+    forced: bool = False
+    """The model hit its token limit without a tagged answer and was made to give one."""
+
+
+def has_answer(text: str) -> bool:
+    """Whether a reply already carries a tagged answer."""
+    result = pyine_parsing.extract_tag_blocks(text, ANSWER_TAG)
+    return pyine_parsing.select_tag_block(result, policy="last") is not None
+
+
+def reasoning_body(choice: str) -> dict[str, typing.Any]:
+    """OpenRouter's request field for a hosted model's separate reasoning; empty leaves the model's default."""
+    if choice == "default":
+        return {}
+    if choice == "off":
+        return {"reasoning": {"enabled": False}}
+    return {"reasoning": {"effort": choice}}
 
 
 def load_prompt(name: str) -> str:
@@ -78,9 +121,26 @@ class Responder:
         temperature: float = 0.0,
         extra_model_kwargs: dict[str, typing.Any] | None = None,
         requests_per_second: float | None = None,
+        force_answer: bool = False,
+        reasoning: str = "default",
     ) -> None:
-        """Build the underlying chat model from the spec."""
+        """Build the underlying chat model from the spec.
+
+        Args:
+            force_answer: When a reply ends without a tagged answer (almost always because it hit
+                ``max_tokens``), send it back and make the model answer under structured decoding.
+            reasoning: For hosted reasoning models: ``default`` leaves the provider's setting,
+                ``off`` disables separate reasoning, ``low``/``medium``/``high`` set its effort.
+                Ignored for vLLM, whose organism reasons in its visible reply.
+        """
+        if reasoning not in REASONING_CHOICES:
+            raise ValueError(f"reasoning must be one of {REASONING_CHOICES}, got {reasoning!r}")
         self.spec = ProviderSpec.parse(spec) if isinstance(spec, str) else spec
+        self.force_answer = force_answer
+        self.reasoning = reasoning if self.spec.provider != "vllm" else "default"
+        self._temperature = temperature
+        self._client: openai.OpenAI | None = None
+        self._client_lock = threading.Lock()
         model_kwargs: dict[str, typing.Any] = {
             "model": self.spec.model,
             "max_tokens": max_tokens,
@@ -90,6 +150,8 @@ class Responder:
             model_kwargs["base_url"] = self.spec.base_url
         if extra_model_kwargs:
             model_kwargs.update(extra_model_kwargs)
+        if reasoning_body(self.reasoning):
+            model_kwargs["extra_body"] = {**model_kwargs.get("extra_body", {}), **reasoning_body(self.reasoning)}
         rate = None
         if requests_per_second:
             rate = {"requests_per_second": requests_per_second, "max_bucket_size": max(1, int(requests_per_second))}
@@ -112,7 +174,66 @@ class Responder:
             config={"callbacks": [handler]},
         )
         text = message.content if isinstance(message.content, str) else str(message.content)
-        return Reply(text=text, completion_tokens=pyine_langchain.extract_token_count_from_handler(handler))
+        reply = Reply(text=text, completion_tokens=pyine_langchain.extract_token_count_from_handler(handler))
+        if self.force_answer and not has_answer(reply.text):
+            return self.force(system, user, reply)
+        return reply
+
+    def force(
+        self,
+        system: str,
+        user: str,
+        reply: Reply,
+    ) -> Reply:
+        """Make a stuck model answer: show it its own unfinished reply and decode one JSON answer.
+
+        The continuation is constrained to ``{"answer": "<string>"}`` by structured decoding, so it
+        cannot ramble again. The answer is appended to the original text inside answer tags, and the
+        reply is marked ``forced`` so an analysis can count it as unanswered if it wants to. If the
+        forcing call itself fails, the original reply is returned unchanged rather than failing the
+        record.
+        """
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": reply.text},
+            {"role": "user", "content": FORCE_PROMPT},
+        ]
+        body: dict[str, typing.Any] = {}
+        if self.spec.provider != "vllm":
+            # only route to providers that honour the schema; hidden reasoning would eat the small budget
+            body = {"provider": {"require_parameters": True}, "reasoning": {"enabled": False}}
+        try:
+            response = self._openai_client().chat.completions.create(
+                model=self.spec.model,
+                messages=messages,  # type: ignore[arg-type]
+                max_tokens=FORCE_MAX_TOKENS,
+                temperature=self._temperature,
+                response_format=ANSWER_SCHEMA,  # type: ignore[arg-type]
+                extra_body=body or None,
+            )
+            raw = response.choices[0].message.content or ""
+            answer = str(json.loads(raw)["answer"]).strip()
+        except Exception as exc:  # forcing is a rescue; never let it fail the record
+            logger.warning("forcing an answer failed for %s: %r", self.spec.describe(), exc)
+            return reply
+        extra = float(response.usage.completion_tokens) if response.usage else 0.0
+        text = f"{reply.text}\n\n<{ANSWER_TAG}>{answer}</{ANSWER_TAG}>"
+        return Reply(text=text, completion_tokens=reply.completion_tokens + extra, forced=True)
+
+    def _endpoint(self) -> tuple[str, str]:
+        """Base URL and API key for direct calls, matching what the LangChain model uses."""
+        base_url = (self.spec.base_url or os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL).rstrip("/")
+        api_key = "EMPTY" if self.spec.provider == "vllm" else os.environ.get("OPENAI_API_KEY", "")
+        return base_url, api_key
+
+    def _openai_client(self) -> openai.OpenAI:
+        """One shared client for forcing calls, created on first use."""
+        with self._client_lock:
+            if self._client is None:
+                base_url, api_key = self._endpoint()
+                self._client = openai.OpenAI(base_url=base_url, api_key=api_key or "EMPTY", max_retries=2)
+            return self._client
 
     def check_reachable(
         self,
@@ -130,9 +251,8 @@ class Responder:
             RuntimeError: when the server cannot be reached, rejects the request, or (vLLM) does
                 not serve the requested model.
         """
-        base_url = (self.spec.base_url or os.environ.get("OPENAI_BASE_URL") or OPENAI_BASE_URL).rstrip("/")
+        base_url, api_key = self._endpoint()
         url = f"{base_url}/models"
-        api_key = "EMPTY" if self.spec.provider == "vllm" else os.environ.get("OPENAI_API_KEY", "")
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         try:
             with httpx.Client(timeout=timeout_seconds, transport=transport) as client:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+
 import pyine.utils.code.output_compare as output_compare
 import pyine.utils.parsing as parsing
 
@@ -32,7 +34,30 @@ def answer_readings(answer: str) -> list[str]:
     for reading in list(readings):
         if "\\n" in reading or "\\t" in reading:
             readings.append(reading.replace("\\n", "\n").replace("\\t", "\t"))
+    for reading in list(readings):
+        as_list = _lines_as_list(reading)
+        if as_list is not None:
+            readings.append(as_list)
     return readings
+
+
+def _lines_as_list(text: str) -> str | None:
+    """Read a value written one element per line as the Python list it describes.
+
+    The organism often answers "what is ``rr``?" with ``0\\n0\\n1`` where the trace holds
+    ``[0, 0, 1]``. Each line is read as a Python literal when it parses as one and as a string
+    otherwise, so ``a\\nb`` becomes ``['a', 'b']``. Text already shaped like a container is left alone.
+    """
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if len(lines) < 2 or text.strip()[:1] in "[({":
+        return None
+    items: list[object] = []
+    for line in lines:
+        try:
+            items.append(ast.literal_eval(line))
+        except (ValueError, SyntaxError):
+            items.append(line)
+    return repr(items)
 
 
 def is_correct(
