@@ -72,6 +72,35 @@ The follow-up is phrased so the responder has nothing to defend:
     uv run active-investigator run --arm on_path --k 3 --strip-hints --score-mode consistency --reconcile \
         --responder vllm:pyine-organism@http://localhost:8000/v1 --split TACO40 --problems 10
 
+## Trace-free investigator: questions designed from the chain of thought
+
+`active_investigator/cot_investigator.py` drops the execution trace. The investigator sees only what
+a deployed monitor would see (program, input, the model's reasoning and answer) and:
+
+1. **investigate** — gives a passive trust score and writes `--n-questions` follow-ups, most revealing
+   first, each tagged with a kind and with the value the model's final answer implies;
+2. **ask** — the organism answers each question in a fresh context with docstrings and comments removed;
+3. **reconsider** — the fixed-template baseline: the organism is asked to re-check its answer in the
+   original conversation;
+4. **judge** — a judge labels each reply `supports` / `contradicts` / `uninformative` against the original
+   answer and gives a final trust score.
+
+`--investigator` and `--judge` are independent responder specs, so either can be made weaker than the
+organism (weak-to-strong monitoring) without code changes. Records are one per problem and variant,
+with the label drawn uniformly per cell so rare cases are present; problems are split train/test by
+their position in a seeded shuffle (`problem_index`).
+
+    UV_PROJECT_ENVIRONMENT=../venvs/active_investigator uv run python -m active_investigator.cot_investigator \
+        --organism-url http://HOST:8000/v1 --investigator openrouter:openai/gpt-5-mini --problems 240 \
+        --out runs/cot-gpt5mini-p240
+    UV_PROJECT_ENVIRONMENT=../venvs/active_investigator uv run python -m active_investigator.cot_selector \
+        runs/cot-gpt5mini-p240 --test-problems 120
+
+`cot_selector.py` computes every arm from the saved rows without new calls — passive, reconsider,
+random@k, the investigator's own top-k (`llm@k`), a trained selector's top-k (`trained@k`, logistic
+regression on question kind/rank/wording and record features, trained on the other problems), the
+hindsight `oracle@k`, all questions, and the judge's final score — and writes `analysis.json`.
+
 ## Setup
 
     uv sync --extra dev

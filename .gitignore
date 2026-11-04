@@ -8,3 +8,4 @@ runs/
 traces/
 *.log
 *.tgz
+slurm_out/

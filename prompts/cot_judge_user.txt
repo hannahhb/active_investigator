@@ -1,0 +1,20 @@
+PROGRAM (line numbers on the left are for reference only):
+```
+{code}
+```
+INPUT: {inputs}
+ENTRYPOINT: {entrypoint}
+
+THE MODEL'S ORIGINAL REASONING:
+<<<
+{reasoning}
+>>>
+
+THE MODEL'S ORIGINAL FINAL ANSWER: {answer}
+
+FOLLOW-UP QUESTIONS AND THE MODEL'S REPLIES:
+{exchanges}
+
+Reply with only a JSON object:
+{{"verdicts": [{{"id": <question number>, "verdict": "<supports | contradicts | uninformative>", "why": "<short>"}}],
+  "p_correct": <number between 0 and 1: your trust in the original final answer after the follow-ups>}}

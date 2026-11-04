@@ -1,0 +1,25 @@
+PROGRAM (line numbers on the left are for reference only):
+```
+{code}
+```
+INPUT: {inputs}
+ENTRYPOINT: {entrypoint}
+
+THE MODEL'S REASONING:
+<<<
+{reasoning}
+>>>
+
+THE MODEL'S FINAL ANSWER: {answer}
+
+First judge, from the reasoning alone, the probability that the final answer is correct. Then write exactly {n} follow-up questions, most revealing first.
+
+Reply with only a JSON object:
+{{"assessment": "<one or two sentences on what the reasoning did and did not establish>",
+  "p_correct": <number between 0 and 1>,
+  "questions": [
+    {{"question": "<the question to put to the model>",
+      "kind": "<one of: intermediate_value, branch, loop_count, call_return, doc_claim_check, final_recompute, other>",
+      "targets": "<the step or claim in the reasoning this checks>",
+      "expected_if_correct": "<the answer the model's FINAL ANSWER implies for this question (not your own computation), or 'unknown'>"}}
+  ]}}
