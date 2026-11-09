@@ -1,0 +1,23 @@
+# AI Village data and anything derived from it that contains its text (dataset terms)
+out/
+*.jsonl.gz
+# model artifacts and large files
+organism/adapter/
+organism/*.tgz
+organism/run.json
+organism/replies_*.jsonl
+*.zip
+# keys
+.env
+# build and OS files
+__pycache__/
+*.pyc
+.DS_Store
+paper/*.aux
+paper/*.log
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.out
+paper/*.bbl
+paper/*.blg
+paper/*.synctex.gz
