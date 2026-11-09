@@ -17,7 +17,7 @@ import pathlib
 import sys
 
 HERE = pathlib.Path(__file__).parent
-ENV = pathlib.Path("/Users/hannah_mac/Documents/ai_safety/ai_village/.env")
+ENV = pathlib.Path(os.environ.get("AI_VILLAGE_DIR", HERE.parent.parent / "ai_village")) / ".env"  # same folder as the data
 STATE = HERE / "run.json"
 MODEL = "Qwen/Qwen3.5-4B"  # small and quick; confirm the id with `models` first
 
